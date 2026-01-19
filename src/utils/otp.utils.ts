@@ -49,3 +49,4 @@ export const verifyOTP = (storedOTP: string, providedOTP: string, expiry: Date):
   }
   return storedOTP === providedOTP;
 };
+
