@@ -13,7 +13,6 @@ import { User } from '../models/User';
 import { Profile } from '../models/Profile';
 import { RefreshToken } from '../models/RefreshToken';
 
-// Request OTP - Step 1 of authentication
 export const requestOTP = async (req: Request, res: Response): Promise<void> => {
   try {
     const errors = validationResult(req);
@@ -29,11 +28,9 @@ export const requestOTP = async (req: Request, res: Response): Promise<void> => 
       return;
     }
 
-    // Generate OTP
     const otp = generateOTP();
     const otpExpiry = getOTPExpiry();
 
-    // Find or create user
     const queryConditions = [];
     if (email) queryConditions.push({ email });
     if (phone) queryConditions.push({ phone });
@@ -43,12 +40,10 @@ export const requestOTP = async (req: Request, res: Response): Promise<void> => 
     });
 
     if (user) {
-      // Existing user - update OTP
       user.otpCode = otp;
       user.otpExpiry = otpExpiry;
       await user.save();
     } else {
-      // New user - create with OTP
       user = await User.create({
         email,
         phone,
@@ -56,11 +51,9 @@ export const requestOTP = async (req: Request, res: Response): Promise<void> => 
         otpExpiry,
       });
 
-      // Create empty profile for new user
       await Profile.create({ userId: user._id });
     }
 
-    // Send OTP
     if (email) {
       await sendOTPEmail(email, otp);
     } else if (phone) {
