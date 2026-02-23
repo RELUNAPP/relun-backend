@@ -1,30 +1,59 @@
-// SMS Service for sending OTP and other messages
-// TODO: Integrate with SMS service (Twilio, AWS SNS, etc.)
+// SMS Service for sending OTP and other messages via Termii
 
 interface SMSOptions {
   to: string;
   message: string;
 }
 
-export const sendSMS = async (options: SMSOptions) => {
+interface TermiiResponse {
+  code: string;
+  message_id: string;
+  message: string;
+  balance: number;
+  user: string;
+}
+
+const TERMII_API_URL = 'https://api.ng.termii.com/api/sms/send';
+
+export const sendSMS = async (options: SMSOptions): Promise<{ success: boolean; messageId: string }> => {
   try {
-    // TODO: Implement actual SMS service (Twilio, AWS SNS, etc.)
-    console.log(`[SMS] Sending SMS to ${options.to}====>>>>`);
-    console.log(`[SMS] Message: ${options.message}`);
+    const apiKey = process.env.TERMII_API_KEY;
+    const senderId = process.env.TERMII_SENDER_ID || 'N-Alert';
 
-    // For development, just log it
-    // In production, use actual SMS service:
-    // const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-    // const result = await client.messages.create({
-    //   body: options.message,
-    //   to: options.to,
-    //   from: process.env.TWILIO_PHONE_NUMBER,
-    // });
-    // return result;
+    if (!apiKey) {
+      console.warn('[SMS] TERMII_API_KEY not set, running in dev mode');
+      console.log(`[SMS] Would send to ${options.to}: ${options.message}`);
+      return { success: true, messageId: 'dev-mode' };
+    }
 
-    return { success: true, messageId: 'dev-mode' };
+    const payload = {
+      to: options.to,
+      from: senderId,
+      sms: options.message,
+      type: 'plain',
+      channel: 'generic',
+      api_key: apiKey,
+    };
+
+    const response = await fetch(TERMII_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = (await response.json()) as TermiiResponse;
+
+    if (data.code === 'ok') {
+      console.log(`[SMS] Successfully sent to ${options.to}, messageId: ${data.message_id}`);
+      return { success: true, messageId: data.message_id };
+    }
+
+    console.error('[SMS] Termii error:', data.message);
+    throw new Error(data.message || 'Failed to send SMS via Termii');
   } catch (error) {
-    console.error('[SMS] Error sending SMS====>>>>', error);
+    console.error('[SMS] Error sending SMS:', error);
     throw new Error('Failed to send SMS');
   }
 };

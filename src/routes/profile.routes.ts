@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { body } from 'express-validator';
+import { body, query } from 'express-validator';
 import { authenticate } from '../middleware/auth.middleware';
 import { upload } from '../middleware/upload.middleware';
 import {
@@ -8,6 +8,7 @@ import {
   uploadPhoto,
   deletePhoto,
   getUserProfile,
+  getNearbyUsers,
 } from '../controllers/profile.controller';
 
 const router = Router();
@@ -40,6 +41,18 @@ router.post('/photos', authenticate, upload.array('photos', 6), uploadPhoto);
 
 // Delete photo
 router.delete('/photos/:photoId', authenticate, deletePhoto);
+
+// Get nearby users for discovery/feed
+router.get(
+  '/discover',
+  authenticate,
+  [
+    query('latitude').optional().isFloat({ min: -90, max: 90 }).withMessage('Invalid latitude'),
+    query('longitude').optional().isFloat({ min: -180, max: 180 }).withMessage('Invalid longitude'),
+    query('limit').optional().isInt({ min: 1, max: 50 }).withMessage('Limit must be between 1 and 50'),
+  ],
+  getNearbyUsers
+);
 
 // Get another user's profile
 router.get('/:userId', authenticate, getUserProfile);

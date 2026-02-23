@@ -5,6 +5,11 @@ import { User } from '../models/User';
 import { Profile } from '../models/Profile';
 import { Photo } from '../models/Photo';
 import { uploadImage, uploadMultipleImages, deleteImage } from '../services/cloudinary.service';
+import { calculateDistance } from '../utils/helpers';
+
+// Location update throttle settings
+const LOCATION_UPDATE_DISTANCE_THRESHOLD = 0.5; // 500 meters in km
+const LOCATION_UPDATE_TIME_THRESHOLD = 5 * 60 * 1000; // 5 minutes in ms
 
 // Complete profile for first-time users
 export const completeProfile = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -311,5 +316,137 @@ export const getUserProfile = async (req: AuthRequest, res: Response): Promise<v
   } catch (error) {
     console.error('Get user profile error:', error);
     res.status(500).json({ error: 'Failed to get profile' });
+  }
+};
+
+// Get nearby users for discovery/feed
+export const getNearbyUsers = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      res.status(400).json({ errors: errors.array() });
+      return;
+    }
+
+    const { limit = 10, latitude, longitude } = req.query;
+    const userId = req.user!.id;
+
+    // Get current user's profile
+    let currentProfile = await Profile.findOne({ userId });
+
+    // Auto-update user location if coordinates are provided (with throttling)
+    if (latitude && longitude) {
+      const lat = parseFloat(latitude as string);
+      const lng = parseFloat(longitude as string);
+
+      // Check if we should update location (throttle to reduce DB writes)
+      let shouldUpdateLocation = true;
+
+      if (currentProfile?.latitude && currentProfile?.longitude && currentProfile?.locationUpdatedAt) {
+        const distanceMoved = calculateDistance(
+          currentProfile.latitude,
+          currentProfile.longitude,
+          lat,
+          lng
+        );
+        const timeSinceLastUpdate = Date.now() - new Date(currentProfile.locationUpdatedAt).getTime();
+
+        // Only update if moved > 500m OR last update was > 5 minutes ago
+        shouldUpdateLocation =
+          distanceMoved > LOCATION_UPDATE_DISTANCE_THRESHOLD ||
+          timeSinceLastUpdate > LOCATION_UPDATE_TIME_THRESHOLD;
+      }
+
+      if (shouldUpdateLocation) {
+        const locationUpdate = {
+          latitude: lat,
+          longitude: lng,
+          locationUpdatedAt: new Date(),
+          location: {
+            type: 'Point',
+            coordinates: [lng, lat], // GeoJSON format: [longitude, latitude]
+          },
+        };
+
+        currentProfile = await Profile.findOneAndUpdate(
+          { userId },
+          { $set: locationUpdate },
+          { new: true, upsert: true }
+        );
+      }
+    }
+
+    const query: any = {
+      _id: { $ne: userId },
+      isActive: true,
+    };
+
+    // Add location-based filtering if available
+    const hasLocation =
+      currentProfile?.location?.coordinates ||
+      (currentProfile?.latitude && currentProfile?.longitude);
+
+    if (hasLocation && currentProfile) {
+      let userLocation;
+
+      // Use GeoJSON location if available, otherwise convert lat/lng
+      if (currentProfile.location?.coordinates) {
+        userLocation = currentProfile.location;
+      } else if (currentProfile.latitude && currentProfile.longitude) {
+        userLocation = {
+          type: 'Point',
+          coordinates: [currentProfile.longitude, currentProfile.latitude],
+        };
+      }
+
+      // Find profile documents within the distance
+      const nearbyProfileUserIds = await Profile.find({
+        location: {
+          $near: {
+            $geometry: userLocation,
+            $maxDistance: 500000, // 500km
+          },
+        },
+      }).distinct('userId');
+
+      if (!nearbyProfileUserIds || nearbyProfileUserIds.length === 0) {
+        res.json({ users: [] });
+        return;
+      }
+
+      // Filter out the current user
+      const filteredNearbyIds = nearbyProfileUserIds.filter(
+        (id) => id.toString() !== userId
+      );
+
+      if (filteredNearbyIds.length === 0) {
+        res.json({ users: [] });
+        return;
+      }
+
+      query._id = { $in: filteredNearbyIds };
+    }
+
+    const users = await User.find(query)
+      .limit(Number(limit))
+      .select('fullName dateOfBirth gender lastActive');
+
+    // Get profiles and photos for each user
+    const usersWithProfiles = await Promise.all(
+      users.map(async (user) => {
+        const profile = await Profile.findOne({ userId: user._id });
+        const photos = await Photo.find({ userId: user._id }).sort({ order: 1 });
+        return {
+          user,
+          profile,
+          photos,
+        };
+      })
+    );
+
+    res.json({ users: usersWithProfiles });
+  } catch (error) {
+    console.error('Get nearby users error:', error);
+    res.status(500).json({ error: 'Failed to get nearby users' });
   }
 };

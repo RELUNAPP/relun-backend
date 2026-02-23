@@ -12,6 +12,7 @@ export interface IProfile extends Document {
   country?: string;
   latitude?: number;
   longitude?: number;
+  locationUpdatedAt?: Date;
   location?: {
     type: string;
     coordinates: number[];
@@ -46,6 +47,7 @@ const profileSchema = new Schema<IProfile>(
     country: String,
     latitude: Number,
     longitude: Number,
+    locationUpdatedAt: Date,
     location: {
       type: {
         type: String,

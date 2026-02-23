@@ -15,7 +15,6 @@ configureCloudinary();
 // Import routes
 import authRoutes from './routes/auth.routes';
 import profileRoutes from './routes/profile.routes';
-import swipeRoutes from './routes/swipe.routes';
 import matchRoutes from './routes/match.routes';
 import chatRoutes from './routes/chat.routes';
 
@@ -63,7 +62,6 @@ app.get('/health', (req: Request, res: Response) => {
 // API Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/profiles', profileRoutes);
-app.use('/api/swipes', swipeRoutes);
 app.use('/api/matches', matchRoutes);
 app.use('/api/chat', chatRoutes);
 
@@ -82,7 +80,7 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
 });
 
 // Start server
-const PORT = process.env.PORT || 8000;
+const PORT = process.env.PORT || 9000;
 
 const startServer = async () => {
   try {
@@ -93,8 +91,8 @@ const startServer = async () => {
       console.log(`
 ╔═══════════════════════════════════════╗
 ║   Relun API Server                    ║
-║   Running on port ${PORT}              ║
-║   Environment: ${process.env.NODE_ENV || 'development'}        ║
+║   Running on port ${PORT}                ║
+║   Environment: ${process.env.NODE_ENV || 'development'}            ║
 ╚═══════════════════════════════════════╝
       `);
     });

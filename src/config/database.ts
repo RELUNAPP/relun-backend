@@ -1,4 +1,10 @@
 import mongoose from 'mongoose';
+import dns from 'dns';
+
+// Fix for systems where Node.js DNS resolver fails for SRV records (dev only)
+if (process.env.NODE_ENV !== 'production') {
+  dns.setServers(['8.8.8.8', '8.8.4.4']);
+}
 
 export const connectDB = async (): Promise<void> => {
   try {
@@ -7,8 +13,8 @@ export const connectDB = async (): Promise<void> => {
     console.log('✅ Connected to MongoDB');
     
     // Ensure indexes are created
-    await mongoose.connection.syncIndexes();
-    console.log('✅ Database indexes synchronized');
+    // await mongoose.connection.syncIndexes();
+    // console.log('✅ Database indexes synchronized');
   } catch (error) {
     console.error('❌ MongoDB connection error:', error);
     process.exit(1);
