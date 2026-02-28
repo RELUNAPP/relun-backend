@@ -9,9 +9,16 @@ import {
   verifyOTP as verifyOTPUtil,
 } from '../utils/otp.utils';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { User } from '../models/User';
+import { User, IUser } from '../models/User';
 import { Profile } from '../models/Profile';
 import { RefreshToken } from '../models/RefreshToken';
+import {
+  RequestOTPRequest,
+  RequestOTPResponse,
+  VerifyOTPRequest,
+  LoginRequest,
+  LoginResponse,
+} from '../types';
 
 export const requestOTP = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -21,7 +28,7 @@ export const requestOTP = async (req: Request, res: Response): Promise<void> => 
       return;
     }
 
-    const { email, phone } = req.body;
+    const { email, phone }: RequestOTPRequest = req.body;
 
     if (!email && !phone) {
       res.status(400).json({ error: 'Email or phone is required' });
@@ -35,7 +42,7 @@ export const requestOTP = async (req: Request, res: Response): Promise<void> => 
     if (email) queryConditions.push({ email });
     if (phone) queryConditions.push({ phone });
 
-    let user: any = await User.findOne({
+    let user: IUser | null = await User.findOne({
       $or: queryConditions,
     });
 
@@ -60,17 +67,18 @@ export const requestOTP = async (req: Request, res: Response): Promise<void> => 
       await sendOTPSMS(phone, otp);
     }
 
-    res.json({
+    const response: RequestOTPResponse = {
       message: 'OTP sent successfully',
       isNewUser: !user.fullName, // If no fullName, they need to complete profile
-    });
+    };
+
+    res.json(response);
   } catch (error) {
     console.error('Request OTP error:', error);
     res.status(500).json({ error: 'Failed to send OTP' });
   }
 };
 
-// Login - Step 3 of authentication (after OTP verification)
 export const login = async (req: Request, res: Response): Promise<void> => {
   try {
     const errors = validationResult(req);
@@ -79,7 +87,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const { email, phone } = req.body;
+    const { email, phone }: LoginRequest = req.body;
 
     if (!email && !phone) {
       res.status(400).json({ error: 'Email or phone is required' });
@@ -99,7 +107,6 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // Check if email/phone is verified
     if (email && !user.isEmailVerified) {
       res.status(403).json({ error: 'Email not verified. Please verify OTP first.' });
       return;
@@ -115,18 +122,15 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // Update last active
     user.lastActive = new Date();
     await user.save();
 
-    // Generate tokens
     const tokens = generateTokenPair({
       userId: user._id.toString(),
       email: user.email || undefined,
       phone: user.phone || undefined,
     });
 
-    // Store refresh token
     const expiryDate = new Date();
     expiryDate.setDate(expiryDate.getDate() + 30);
 
@@ -136,35 +140,34 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       expiresAt: expiryDate,
     });
 
-    // Get profile
     const profile = await Profile.findOne({ userId: user._id }).select(
       'bio city segment isComplete completenessScore'
     );
 
-    // Check if profile needs completion
     const needsProfileCompletion =
       !user.fullName || !user.dateOfBirth || !user.gender || !profile?.segment;
     const needsEmail = !user.email;
     const needsPhone = !user.phone;
 
-    res.json({
+    const response: LoginResponse = {
       ...tokens,
       user: {
         ...user.toObject(),
         id: user._id.toString(),
-        profile,
+        profile: profile?.toObject(),
       },
       needsProfileCompletion,
       needsEmail,
       needsPhone,
-    });
+    };
+
+    res.json(response);
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: 'Login failed' });
   }
 };
 
-// Verify OTP - Step 2 of authentication
 export const verifyOTP = async (req: Request, res: Response): Promise<void> => {
   try {
     const errors = validationResult(req);
@@ -173,7 +176,7 @@ export const verifyOTP = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const { email, phone, otp } = req.body;
+    const { email, phone, otp }: VerifyOTPRequest = req.body;
 
     if (!email && !phone) {
       res.status(400).json({ error: 'Email or phone is required' });
@@ -198,7 +201,6 @@ export const verifyOTP = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // Verify OTP
     const isValidOTP = verifyOTPUtil(user.otpCode, otp, user.otpExpiry);
 
     if (!isValidOTP) {
@@ -211,7 +213,6 @@ export const verifyOTP = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // Mark email/phone as verified
     if (email) {
       user.isEmailVerified = true;
     }
@@ -219,22 +220,18 @@ export const verifyOTP = async (req: Request, res: Response): Promise<void> => {
       user.isPhoneVerified = true;
     }
 
-    // Clear OTP
     user.otpCode = undefined;
     user.otpExpiry = undefined;
 
-    // Update last active
     user.lastActive = new Date();
     await user.save();
 
-    // Generate tokens (auto-login after OTP verification)
     const tokens = generateTokenPair({
       userId: user._id.toString(),
       email: user.email || undefined,
       phone: user.phone || undefined,
     });
 
-    // Store refresh token
     const expiryDate = new Date();
     expiryDate.setDate(expiryDate.getDate() + 30);
 
@@ -244,28 +241,28 @@ export const verifyOTP = async (req: Request, res: Response): Promise<void> => {
       expiresAt: expiryDate,
     });
 
-    // Get profile
     const profile = await Profile.findOne({ userId: user._id }).select(
       'bio city segment isComplete completenessScore'
     );
 
-    // Check if profile needs completion
     const needsProfileCompletion =
       !user.fullName || !user.dateOfBirth || !user.gender || !profile?.segment;
     const needsEmail = !user.email;
     const needsPhone = !user.phone;
 
-    res.json({
+    const response: LoginResponse = {
       ...tokens,
       user: {
         ...user.toObject(),
         id: user._id.toString(),
-        profile,
+        profile: profile?.toObject(),
       },
       needsProfileCompletion,
       needsEmail,
       needsPhone,
-    });
+    };
+
+    res.json(response);
   } catch (error) {
     console.error('Verify OTP error:', error);
     res.status(500).json({ error: 'OTP verification failed' });
@@ -300,10 +297,8 @@ export const logout = async (req: AuthRequest, res: Response): Promise<void> => 
   try {
     const userId = req.user!.id;
 
-    // Delete all refresh tokens for this user
     await RefreshToken.deleteMany({ userId });
 
-    // Update user's last active
     await User.findByIdAndUpdate(userId, { lastActive: new Date() });
 
     res.json({ message: 'Logged out successfully' });

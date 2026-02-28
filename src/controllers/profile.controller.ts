@@ -6,6 +6,12 @@ import { Profile } from '../models/Profile';
 import { Photo } from '../models/Photo';
 import { uploadImage, uploadMultipleImages, deleteImage } from '../services/cloudinary.service';
 import { calculateDistance } from '../utils/helpers';
+import {
+  CompleteProfileRequest,
+  ProfileUpdateData,
+  CompleteProfileResponseDto,
+  UserDto,
+} from '../types';
 
 // Location update throttle settings
 const LOCATION_UPDATE_DISTANCE_THRESHOLD = 0.5; // 500 meters in km
@@ -20,8 +26,17 @@ export const completeProfile = async (req: AuthRequest, res: Response): Promise<
       return;
     }
 
-    const { fullName, dateOfBirth, gender, bio, segment, email, phone, latitude, longitude } =
-      req.body;
+    const {
+      fullName,
+      dateOfBirth,
+      gender,
+      bio,
+      segment,
+      email,
+      phone,
+      latitude,
+      longitude,
+    }: CompleteProfileRequest = req.body;
 
     const user = await User.findById(req.user!.id);
 
@@ -30,14 +45,12 @@ export const completeProfile = async (req: AuthRequest, res: Response): Promise<
       return;
     }
 
-    // Update user info
     if (fullName) user.fullName = fullName;
     if (dateOfBirth) user.dateOfBirth = new Date(dateOfBirth);
     if (gender) user.gender = gender;
 
     // If user signed up with phone, they must provide email (and vice versa)
     if (email && !user.email) {
-      // Check if email is already taken
       const existingEmail = await User.findOne({ email });
       if (existingEmail) {
         res.status(400).json({ error: 'Email already in use' });
@@ -47,7 +60,6 @@ export const completeProfile = async (req: AuthRequest, res: Response): Promise<
     }
 
     if (phone && !user.phone) {
-      // Check if phone is already taken
       const existingPhone = await User.findOne({ phone });
       if (existingPhone) {
         res.status(400).json({ error: 'Phone already in use' });
@@ -58,23 +70,27 @@ export const completeProfile = async (req: AuthRequest, res: Response): Promise<
 
     await user.save();
 
-    // Prepare profile update data
-    const profileUpdateData: any = {
+    const profileUpdateData: ProfileUpdateData = {
+      fullName,
+      dateOfBirth,
+      gender,
       bio,
       segment,
+      email,
+      phone,
+      latitude,
+      longitude,
     };
 
-    // Handle location conversion from latitude/longitude to GeoJSON
     if (latitude && longitude) {
       profileUpdateData.latitude = latitude;
       profileUpdateData.longitude = longitude;
       profileUpdateData.location = {
         type: 'Point',
-        coordinates: [longitude, latitude], // [longitude, latitude]
+        coordinates: [longitude, latitude],
       };
     }
 
-    // Update profile
     const profile = await Profile.findOneAndUpdate(
       { userId: user._id },
       { $set: profileUpdateData },
@@ -82,7 +98,7 @@ export const completeProfile = async (req: AuthRequest, res: Response): Promise<
     );
 
     // Calculate completeness
-    const requiredFields = ['bio', 'segment'];
+    const requiredFields = ['segment'];
     const userRequiredFields = ['fullName', 'dateOfBirth', 'gender', 'email', 'phone'];
 
     const filledProfileFields = requiredFields.filter((field) => profile.get(field));
@@ -98,18 +114,22 @@ export const completeProfile = async (req: AuthRequest, res: Response): Promise<
     profile.isComplete = isComplete;
     await profile.save();
 
-    res.json({
-      user: {
-        id: user._id.toString(),
-        email: user.email,
-        phone: user.phone,
-        fullName: user.fullName,
-        dateOfBirth: user.dateOfBirth,
-        gender: user.gender,
-      },
-      profile,
+    const userDto: UserDto = {
+      id: user._id.toString(),
+      email: user.email,
+      phone: user.phone,
+      fullName: user.fullName,
+      dateOfBirth: user.dateOfBirth,
+      gender: user.gender,
+    };
+
+    const response: CompleteProfileResponseDto = {
+      user: userDto,
+      profile: profile.toObject() as unknown as Record<string, unknown>,
       isComplete,
-    });
+    };
+
+    res.json(response);
   } catch (error) {
     console.error('Complete profile error:', error);
     res.status(500).json({ error: 'Failed to complete profile' });
@@ -145,22 +165,13 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
-    const updateData: any = { ...req.body };
+    const updateData: ProfileUpdateData = { ...req.body };
 
     // Handle location conversion from latitude/longitude to GeoJSON
     if (updateData.latitude && updateData.longitude) {
       updateData.location = {
         type: 'Point',
         coordinates: [updateData.longitude, updateData.latitude], // [longitude, latitude]
-      };
-    } else if (
-      updateData.location &&
-      updateData.location.latitude &&
-      updateData.location.longitude
-    ) {
-      updateData.location = {
-        type: 'Point',
-        coordinates: [updateData.location.longitude, updateData.location.latitude],
       };
     }
 
@@ -174,7 +185,7 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
     const requiredFields = ['bio', 'city', 'segment', 'lookingFor', 'interests'];
     const filledFields = requiredFields.filter((field) => profile.get(field));
     const completenessScore = Math.round((filledFields.length / requiredFields.length) * 100);
-    const isComplete = completenessScore >= 80;
+    const isComplete = completenessScore >= 90;
 
     profile.completenessScore = completenessScore;
     profile.isComplete = isComplete;
@@ -342,14 +353,19 @@ export const getNearbyUsers = async (req: AuthRequest, res: Response): Promise<v
       // Check if we should update location (throttle to reduce DB writes)
       let shouldUpdateLocation = true;
 
-      if (currentProfile?.latitude && currentProfile?.longitude && currentProfile?.locationUpdatedAt) {
+      if (
+        currentProfile?.latitude &&
+        currentProfile?.longitude &&
+        currentProfile?.locationUpdatedAt
+      ) {
         const distanceMoved = calculateDistance(
           currentProfile.latitude,
           currentProfile.longitude,
           lat,
           lng
         );
-        const timeSinceLastUpdate = Date.now() - new Date(currentProfile.locationUpdatedAt).getTime();
+        const timeSinceLastUpdate =
+          Date.now() - new Date(currentProfile.locationUpdatedAt).getTime();
 
         // Only update if moved > 500m OR last update was > 5 minutes ago
         shouldUpdateLocation =
@@ -415,9 +431,7 @@ export const getNearbyUsers = async (req: AuthRequest, res: Response): Promise<v
       }
 
       // Filter out the current user
-      const filteredNearbyIds = nearbyProfileUserIds.filter(
-        (id) => id.toString() !== userId
-      );
+      const filteredNearbyIds = nearbyProfileUserIds.filter((id) => id.toString() !== userId);
 
       if (filteredNearbyIds.length === 0) {
         res.json({ users: [] });

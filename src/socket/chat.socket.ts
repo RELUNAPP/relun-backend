@@ -1,8 +1,15 @@
 import { Server, Socket } from 'socket.io';
 import { verifyToken } from '../utils/jwt.utils';
-import { Match } from '../models/Match';
-import { Message } from '../models/Message';
+import { Message, getConversationId } from '../models/Message';
 import { User } from '../models/User';
+import {
+  SocketSendMessageData,
+  SocketTypingData,
+  SocketMarkReadData,
+  SocketNewMessageEvent,
+  SocketUserTypingEvent,
+  SocketMessagesReadEvent,
+} from '../types';
 
 interface AuthenticatedSocket extends Socket {
   userId?: string;
@@ -39,98 +46,87 @@ export const initializeSocketIO = (io: Server) => {
     // Join user's room
     socket.join(`user:${socket.userId}`);
 
-    // Join match room
-    socket.on('join_match', async (matchId: string) => {
+    // Join conversation room
+    socket.on('join_conversation', async (recipientId: string) => {
       try {
-        const match = await Match.findOne({
-          _id: matchId,
-          $or: [{ user1Id: socket.userId }, { user2Id: socket.userId }],
-        });
-
-        if (match) {
-          socket.join(`match:${matchId}`);
-          console.log(`User ${socket.userId} joined match ${matchId}`);
+        if (socket.userId) {
+          const conversationId = getConversationId(socket.userId, recipientId);
+          socket.join(`conversation:${conversationId}`);
+          console.log(`User ${socket.userId} joined conversation ${conversationId}`);
         }
       } catch (error) {
-        console.error('Join match error:', error);
+        console.error('Join conversation error:', error);
       }
     });
 
-    // Leave match room
-    socket.on('leave_match', (matchId: string) => {
-      socket.leave(`match:${matchId}`);
-      console.log(`User ${socket.userId} left match ${matchId}`);
+    // Leave conversation room
+    socket.on('leave_conversation', (recipientId: string) => {
+      if (socket.userId) {
+        const conversationId = getConversationId(socket.userId, recipientId);
+        socket.leave(`conversation:${conversationId}`);
+        console.log(`User ${socket.userId} left conversation ${conversationId}`);
+      }
     });
 
     // Send message
-    socket.on(
-      'send_message',
-      async (data: { matchId: string; content: string; messageType?: string }) => {
-        try {
-          const { matchId, content, messageType = 'text' } = data;
-
-          // Verify user is part of the match
-          const match = await Match.findOne({
-            _id: matchId,
-            $or: [{ user1Id: socket.userId }, { user2Id: socket.userId }],
-          });
-
-          if (!match) {
-            socket.emit('error', { message: 'Match not found' });
-            return;
-          }
-
-          const receiverId =
-            match.user1Id.toString() === socket.userId ? match.user2Id : match.user1Id;
-
-          // Create message
-          const message = await Message.create({
-            matchId,
-            senderId: socket.userId,
-            receiverId,
-            content,
-            messageType,
-          });
-
-          // Update match's last message timestamp
-          // match.lastMessageAt = new Date();
-          await match.save();
-
-          const populatedMessage = await Message.findById(message._id)
-            .populate('senderId', 'fullName')
-            .populate('receiverId', 'fullName');
-
-          // Emit to match room
-          io.to(`match:${matchId}`).emit('new_message', populatedMessage);
-
-          // Emit to receiver's room for notification
-          io.to(`user:${receiverId}`).emit('message_notification', {
-            matchId,
-            message: populatedMessage,
-          });
-        } catch (error) {
-          console.error('Send message error:', error);
-          socket.emit('error', { message: 'Failed to send message' });
-        }
-      }
-    );
-
-    // Typing indicator
-    socket.on('typing', async (data: { matchId: string; isTyping: boolean }) => {
+    socket.on('send_message', async (data: SocketSendMessageData) => {
       try {
-        const { matchId, isTyping } = data;
+        const { recipientId, content, messageType = 'text' } = data;
 
-        // Verify user is part of the match
-        const match = await Match.findOne({
-          _id: matchId,
-          $or: [{ user1Id: socket.userId }, { user2Id: socket.userId }],
+        if (!socket.userId) {
+          socket.emit('error', { message: 'Not authenticated' });
+          return;
+        }
+
+        // Verify recipient exists
+        const recipient = await User.findById(recipientId);
+        if (!recipient) {
+          socket.emit('error', { message: 'Recipient not found' });
+          return;
+        }
+
+        const conversationId = getConversationId(socket.userId, recipientId);
+
+        // Create message
+        const message = await Message.create({
+          conversationId,
+          senderId: socket.userId,
+          receiverId: recipientId,
+          content,
+          messageType,
         });
 
-        if (match) {
-          socket.to(`match:${matchId}`).emit('user_typing', {
+        const populatedMessage = await Message.findById(message._id)
+          .populate('senderId', 'fullName')
+          .populate('receiverId', 'fullName');
+
+        // Emit to conversation room
+        const newMessageEvent: SocketNewMessageEvent = {
+          conversationId,
+          message: populatedMessage as any,
+        };
+        io.to(`conversation:${conversationId}`).emit('new_message', newMessageEvent);
+
+        // Emit to receiver's room for notification
+        io.to(`user:${recipientId}`).emit('message_notification', newMessageEvent);
+      } catch (error) {
+        console.error('Send message error:', error);
+        socket.emit('error', { message: 'Failed to send message' });
+      }
+    });
+
+    // Typing indicator
+    socket.on('typing', async (data: SocketTypingData) => {
+      try {
+        const { recipientId, isTyping } = data;
+
+        if (socket.userId) {
+          const conversationId = getConversationId(socket.userId, recipientId);
+          const typingEvent: SocketUserTypingEvent = {
             userId: socket.userId,
             isTyping,
-          });
+          };
+          socket.to(`conversation:${conversationId}`).emit('user_typing', typingEvent);
         }
       } catch (error) {
         console.error('Typing error:', error);
@@ -138,20 +134,25 @@ export const initializeSocketIO = (io: Server) => {
     });
 
     // Mark messages as read
-    socket.on('mark_read', async (data: { matchId: string }) => {
+    socket.on('mark_read', async (data: SocketMarkReadData) => {
       try {
-        const { matchId } = data;
+        const { recipientId } = data;
 
-        await Message.updateMany(
-          { matchId, receiverId: socket.userId, isRead: false },
-          { $set: { isRead: true, readAt: new Date() } }
-        );
+        if (socket.userId) {
+          const conversationId = getConversationId(socket.userId, recipientId);
 
-        // Notify sender
-        socket.to(`match:${matchId}`).emit('messages_read', {
-          matchId,
-          readBy: socket.userId,
-        });
+          await Message.updateMany(
+            { conversationId, receiverId: socket.userId, isRead: false },
+            { $set: { isRead: true, readAt: new Date() } }
+          );
+
+          // Notify sender
+          const readEvent: SocketMessagesReadEvent = {
+            conversationId,
+            readBy: socket.userId,
+          };
+          socket.to(`conversation:${conversationId}`).emit('messages_read', readEvent);
+        }
       } catch (error) {
         console.error('Mark read error:', error);
       }

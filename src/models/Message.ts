@@ -1,7 +1,7 @@
 import mongoose, { Schema, Document, Types } from 'mongoose';
 
 export interface IMessage extends Document {
-  matchId: Types.ObjectId;
+  conversationId: string;
   senderId: Types.ObjectId;
   receiverId: Types.ObjectId;
   content: string;
@@ -11,7 +11,7 @@ export interface IMessage extends Document {
 
 const messageSchema = new Schema<IMessage>(
   {
-    matchId: { type: Schema.Types.ObjectId, ref: 'Match', required: true },
+    conversationId: { type: String, required: true, index: true },
     senderId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
     receiverId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
     content: { type: String, required: true },
@@ -20,5 +20,10 @@ const messageSchema = new Schema<IMessage>(
   },
   { timestamps: true }
 );
+
+// Helper function to generate a deterministic conversation ID from two user IDs
+export const getConversationId = (userId1: string, userId2: string): string => {
+  return [userId1, userId2].sort().join('_');
+};
 
 export const Message = mongoose.model<IMessage>('Message', messageSchema);

@@ -9,6 +9,7 @@ import {
   deletePhoto,
   getUserProfile,
   getNearbyUsers,
+  completeProfile,
 } from '../controllers/profile.controller';
 
 const router = Router();
@@ -32,8 +33,8 @@ router.put(
   updateProfile
 );
 
-// Upload photo (supports single or multiple files, max 6 total)
-router.post('/photos', authenticate, upload.array('photos', 6), uploadPhoto);
+// Upload photo (supports single or multiple files, max 3 total)
+router.post('/photos', authenticate, upload.array('photos', 3), uploadPhoto);
 // router.post('/photos', authenticate, upload.fields([
 //   { name: 'photo', maxCount: 1 },
 //   { name: 'photos', maxCount: 6 }
@@ -49,12 +50,33 @@ router.get(
   [
     query('latitude').optional().isFloat({ min: -90, max: 90 }).withMessage('Invalid latitude'),
     query('longitude').optional().isFloat({ min: -180, max: 180 }).withMessage('Invalid longitude'),
-    query('limit').optional().isInt({ min: 1, max: 50 }).withMessage('Limit must be between 1 and 50'),
+    query('limit')
+      .optional()
+      .isInt({ min: 1, max: 50 })
+      .withMessage('Limit must be between 1 and 50'),
   ],
   getNearbyUsers
 );
 
 // Get another user's profile
 router.get('/:userId', authenticate, getUserProfile);
+
+// Complete profile (for new users)
+router.post(
+  '/complete-profile',
+  authenticate,
+  [
+    body('fullName').notEmpty().withMessage('Full name is required'),
+    body('dateOfBirth').isISO8601().withMessage('Valid date of birth is required'),
+    body('gender').isIn(['male', 'female', 'non_binary', 'other']).withMessage('Invalid gender'),
+    body('segment').isIn(['relationship', 'fun']).withMessage('Invalid segment'),
+    body('bio').optional().isString().isLength({ max: 500 }),
+    body('email').optional().isEmail(),
+    body('phone').optional().isMobilePhone('any'),
+    body('latitude').optional().isFloat({ min: -90, max: 90 }).withMessage('Invalid latitude'),
+    body('longitude').optional().isFloat({ min: -180, max: 180 }).withMessage('Invalid longitude'),
+  ],
+  completeProfile
+);
 
 export default router;

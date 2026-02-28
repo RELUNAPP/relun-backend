@@ -15,7 +15,6 @@ configureCloudinary();
 // Import routes
 import authRoutes from './routes/auth.routes';
 import profileRoutes from './routes/profile.routes';
-import matchRoutes from './routes/match.routes';
 import chatRoutes from './routes/chat.routes';
 
 // Import socket handler
@@ -62,7 +61,6 @@ app.get('/health', (req: Request, res: Response) => {
 // API Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/profiles', profileRoutes);
-app.use('/api/matches', matchRoutes);
 app.use('/api/chat', chatRoutes);
 
 // 404 handler

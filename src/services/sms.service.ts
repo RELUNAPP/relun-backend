@@ -15,7 +15,9 @@ interface TermiiResponse {
 
 const TERMII_API_URL = 'https://api.ng.termii.com/api/sms/send';
 
-export const sendSMS = async (options: SMSOptions): Promise<{ success: boolean; messageId: string }> => {
+export const sendSMS = async (
+  options: SMSOptions
+): Promise<{ success: boolean; messageId: string }> => {
   try {
     const apiKey = process.env.TERMII_API_KEY;
     const senderId = process.env.TERMII_SENDER_ID || 'N-Alert';

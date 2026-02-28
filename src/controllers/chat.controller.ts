@@ -1,50 +1,45 @@
 import { Response } from 'express';
 import { validationResult } from 'express-validator';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { Match } from '../models/Match';
-import { Message } from '../models/Message';
+import { Message, getConversationId } from '../models/Message';
+import { User } from '../models/User';
+import { GetMessagesResponse, SendMessageRequest, UnreadCountResponse } from '../types';
 
 export const getMessages = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { matchId } = req.params;
+    const { recipientId } = req.params;
     const { page = 1, limit = 50 } = req.query;
     const userId = req.user!.id;
 
-    // Verify user is part of the match
-    const match = await Match.findOne({
-      _id: matchId,
-      $or: [{ user1Id: userId }, { user2Id: userId }],
-    });
+    // Generate conversation ID from the two user IDs
+    const conversationId = getConversationId(userId, recipientId);
 
-    if (!match) {
-      res.status(404).json({ error: 'Match not found' });
-      return;
-    }
-
-    const messages = await Message.find({ matchId })
+    const messages = await Message.find({ conversationId })
       .sort({ createdAt: -1 })
       .skip((Number(page) - 1) * Number(limit))
       .limit(Number(limit))
       .populate('senderId', 'fullName')
       .populate('receiverId', 'fullName');
 
-    const total = await Message.countDocuments({ matchId });
+    const total = await Message.countDocuments({ conversationId });
 
     // Mark messages as read
     await Message.updateMany(
-      { matchId, receiverId: userId, isRead: false },
+      { conversationId, receiverId: userId, isRead: false },
       { $set: { isRead: true, readAt: new Date() } }
     );
 
-    res.json({
-      messages: messages.reverse(), // Reverse to show oldest first
+    const response: GetMessagesResponse = {
+      messages: messages.reverse() as any, // Reverse to show oldest first
       pagination: {
         page: Number(page),
         limit: Number(limit),
         total,
         pages: Math.ceil(total / Number(limit)),
       },
-    });
+    };
+
+    res.json(response);
   } catch (error) {
     console.error('Get messages error:', error);
     res.status(500).json({ error: 'Failed to get messages' });
@@ -59,34 +54,27 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    const { matchId } = req.params;
-    const { content, messageType = 'text' } = req.body;
+    const { recipientId } = req.params;
+    const { content, messageType = 'text' }: SendMessageRequest = req.body;
     const userId = req.user!.id;
 
-    // Verify user is part of the match
-    const match = await Match.findOne({
-      _id: matchId,
-      $or: [{ user1Id: userId }, { user2Id: userId }],
-    });
-
-    if (!match) {
-      res.status(404).json({ error: 'Match not found' });
+    // Verify recipient exists
+    const recipient = await User.findById(recipientId);
+    if (!recipient) {
+      res.status(404).json({ error: 'Recipient not found' });
       return;
     }
 
-    const receiverId = match.user1Id.toString() === userId ? match.user2Id : match.user1Id;
+    // Generate conversation ID from the two user IDs
+    const conversationId = getConversationId(userId, recipientId);
 
     const message = await Message.create({
-      matchId,
+      conversationId,
       senderId: userId,
-      receiverId,
+      receiverId: recipientId,
       content,
       messageType,
     });
-
-    // Update match's last message timestamp
-    // match.lastMessageAt = new Date();
-    await match.save();
 
     const populatedMessage = await Message.findById(message._id)
       .populate('senderId', 'fullName')
@@ -101,12 +89,14 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
 
 export const deleteMessage = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { matchId, messageId } = req.params;
+    const { recipientId, messageId } = req.params;
     const userId = req.user!.id;
+
+    const conversationId = getConversationId(userId, recipientId);
 
     const message = await Message.findOne({
       _id: messageId,
-      matchId,
+      conversationId,
       senderId: userId,
     });
 
@@ -133,9 +123,70 @@ export const getUnreadCount = async (req: AuthRequest, res: Response): Promise<v
       isRead: false,
     });
 
-    res.json({ unreadCount });
+    const response: UnreadCountResponse = { unreadCount };
+    res.json(response);
   } catch (error) {
     console.error('Get unread count error:', error);
     res.status(500).json({ error: 'Failed to get unread count' });
+  }
+};
+
+export const getConversations = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.id;
+
+    // Get all unique conversations for this user
+    const conversations = await Message.aggregate([
+      {
+        $match: {
+          $or: [{ senderId: userId }, { receiverId: userId }],
+        },
+      },
+      {
+        $sort: { createdAt: -1 },
+      },
+      {
+        $group: {
+          _id: '$conversationId',
+          lastMessage: { $first: '$$ROOT' },
+          unreadCount: {
+            $sum: {
+              $cond: [
+                { $and: [{ $eq: ['$receiverId', userId] }, { $eq: ['$isRead', false] }] },
+                1,
+                0,
+              ],
+            },
+          },
+        },
+      },
+      {
+        $sort: { 'lastMessage.createdAt': -1 },
+      },
+    ]);
+
+    // Get the other user details for each conversation
+    const conversationsWithUsers = await Promise.all(
+      conversations.map(async (conv) => {
+        const otherUserId =
+          conv.lastMessage.senderId.toString() === userId
+            ? conv.lastMessage.receiverId
+            : conv.lastMessage.senderId;
+
+        const otherUser = await User.findById(otherUserId).select('fullName email');
+
+        return {
+          conversationId: conv._id,
+          otherUser,
+          lastMessage: conv.lastMessage,
+          unreadCount: conv.unreadCount,
+        };
+      })
+    );
+
+    res.json({ conversations: conversationsWithUsers });
+  } catch (error) {
+    console.error('Get conversations error:', error);
+    res.status(500).json({ error: 'Failed to get conversations' });
   }
 };

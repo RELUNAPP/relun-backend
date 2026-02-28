@@ -47,4 +47,3 @@ export const sendEmail = async (options: EmailOptions) => {
     throw new Error('Failed to send email');
   }
 };
-
