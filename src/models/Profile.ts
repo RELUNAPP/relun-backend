@@ -34,6 +34,33 @@ export interface IProfile extends Document {
   completenessScore: number;
 }
 
+const geoPointSchema = new Schema(
+  {
+    type: {
+      type: String,
+      enum: ['Point'],
+    },
+    coordinates: {
+      type: [Number],
+      default: undefined,
+      validate: {
+        validator: (coords: number[] | undefined) => {
+          if (!coords) return true;
+          return (
+            coords.length === 2 &&
+            typeof coords[0] === 'number' &&
+            !Number.isNaN(coords[0]) &&
+            typeof coords[1] === 'number' &&
+            !Number.isNaN(coords[1])
+          );
+        },
+        message: 'location.coordinates must contain exactly [longitude, latitude]',
+      },
+    },
+  },
+  { _id: false }
+);
+
 const profileSchema = new Schema<IProfile>(
   {
     userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, unique: true },
@@ -49,14 +76,8 @@ const profileSchema = new Schema<IProfile>(
     longitude: Number,
     locationUpdatedAt: Date,
     location: {
-      type: {
-        type: String,
-        enum: ['Point'],
-        default: 'Point',
-      },
-      coordinates: {
-        type: [Number],
-      },
+      type: geoPointSchema,
+      default: undefined,
     },
     height: Number,
     bodyType: String,

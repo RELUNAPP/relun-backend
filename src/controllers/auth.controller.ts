@@ -103,17 +103,17 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     });
 
     if (!user) {
-      res.status(404).json({ error: 'User not found' });
+      res.status(404).json({ error: 'This user doesn\'t exist' });
       return;
     }
 
     if (email && !user.isEmailVerified) {
-      res.status(403).json({ error: 'Email not verified. Please verify OTP first.' });
+      res.status(403).json({ error: 'Email not verified. Please verify.' });
       return;
     }
 
     if (phone && !user.isPhoneVerified) {
-      res.status(403).json({ error: 'Phone not verified. Please verify OTP first.' });
+      res.status(403).json({ error: 'Phone not verified. Please verify.' });
       return;
     }
 

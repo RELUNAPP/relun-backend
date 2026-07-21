@@ -1,10 +1,12 @@
 import { Response } from 'express';
 import { validationResult } from 'express-validator';
+import { Types } from 'mongoose';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { User } from '../models/User';
 import { Profile } from '../models/Profile';
 import { Photo } from '../models/Photo';
-import { uploadImage, uploadMultipleImages, deleteImage } from '../services/cloudinary.service';
+import { Like } from '../models/Like';
+import { uploadImage, uploadMultipleImages } from '../services/cloudinary.service';
 import { calculateDistance } from '../utils/helpers';
 import {
   CompleteProfileRequest,
@@ -16,6 +18,38 @@ import {
 // Location update throttle settings
 const LOCATION_UPDATE_DISTANCE_THRESHOLD = 0.5; // 500 meters in km
 const LOCATION_UPDATE_TIME_THRESHOLD = 5 * 60 * 1000; // 5 minutes in ms
+
+const isLocationIndexError = (error: unknown): boolean => {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+
+  const maybeError = error as { code?: number; codeName?: string };
+  return maybeError.code === 16755 || maybeError.codeName === 'Location16755';
+};
+
+const clearInvalidLocationForUser = async (userId: string | Types.ObjectId) => {
+  const normalizedUserId = typeof userId === 'string' ? new Types.ObjectId(userId) : userId;
+
+  await Profile.collection.updateOne(
+    {
+      userId: normalizedUserId,
+      location: { $exists: true },
+      $or: [
+        { 'location.type': { $exists: false } },
+        { 'location.type': { $ne: 'Point' } },
+        { 'location.coordinates.0': { $exists: false } },
+        { 'location.coordinates.1': { $exists: false } },
+        { 'location.coordinates.2': { $exists: true } },
+      ],
+    },
+    {
+      $unset: {
+        location: '',
+      },
+    }
+  );
+};
 
 // Complete profile for first-time users
 export const completeProfile = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -82,7 +116,7 @@ export const completeProfile = async (req: AuthRequest, res: Response): Promise<
       longitude,
     };
 
-    if (latitude && longitude) {
+    if (latitude !== undefined && longitude !== undefined) {
       profileUpdateData.latitude = latitude;
       profileUpdateData.longitude = longitude;
       profileUpdateData.location = {
@@ -91,11 +125,28 @@ export const completeProfile = async (req: AuthRequest, res: Response): Promise<
       };
     }
 
-    const profile = await Profile.findOneAndUpdate(
-      { userId: user._id },
-      { $set: profileUpdateData },
-      { new: true, upsert: true }
-    );
+    await clearInvalidLocationForUser(user._id);
+
+    let profile;
+    try {
+      profile = await Profile.findOneAndUpdate(
+        { userId: user._id },
+        { $set: profileUpdateData },
+        { new: true, upsert: true }
+      );
+    } catch (error) {
+      if (!isLocationIndexError(error)) {
+        throw error;
+      }
+
+      await Profile.collection.updateOne({ userId: user._id }, { $unset: { location: '' } });
+
+      profile = await Profile.findOneAndUpdate(
+        { userId: user._id },
+        { $set: profileUpdateData },
+        { new: true, upsert: true }
+      );
+    }
 
     // Calculate completeness
     const requiredFields = ['segment'];
@@ -145,10 +196,13 @@ export const getProfile = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
+    const user = await User.findById(req.user!.id).select('fullName dateOfBirth gender email phone');
+
     const photos = await Photo.find({ userId: req.user!.id }).sort({ order: 1 });
 
     res.json({
-      ...profile.toObject(),
+      user,
+      profile: profile.toObject(),
       photos,
     });
   } catch (error) {
@@ -167,19 +221,50 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
 
     const updateData: ProfileUpdateData = { ...req.body };
 
+    if (typeof req.body.fullName === 'string') {
+      const trimmedFullName = req.body.fullName.trim();
+
+      if (trimmedFullName.length > 0) {
+        await User.findByIdAndUpdate(req.user!.id, { fullName: trimmedFullName });
+      }
+    }
+
+    // fullName belongs to User model, not Profile model
+    delete updateData.fullName;
+
     // Handle location conversion from latitude/longitude to GeoJSON
-    if (updateData.latitude && updateData.longitude) {
+    if (updateData.latitude !== undefined && updateData.longitude !== undefined) {
       updateData.location = {
         type: 'Point',
         coordinates: [updateData.longitude, updateData.latitude], // [longitude, latitude]
       };
     }
 
-    const profile = await Profile.findOneAndUpdate(
-      { userId: req.user!.id },
-      { $set: updateData },
-      { new: true, upsert: true }
-    );
+    await clearInvalidLocationForUser(req.user!.id);
+
+    let profile;
+    try {
+      profile = await Profile.findOneAndUpdate(
+        { userId: req.user!.id },
+        { $set: updateData },
+        { new: true, upsert: true }
+      );
+    } catch (error) {
+      if (!isLocationIndexError(error)) {
+        throw error;
+      }
+
+      await Profile.collection.updateOne(
+        { userId: new Types.ObjectId(req.user!.id) },
+        { $unset: { location: '' } }
+      );
+
+      profile = await Profile.findOneAndUpdate(
+        { userId: req.user!.id },
+        { $set: updateData },
+        { new: true, upsert: true }
+      );
+    }
 
     // Calculate completeness
     const requiredFields = ['bio', 'city', 'segment', 'lookingFor', 'interests'];
@@ -271,6 +356,40 @@ export const uploadPhoto = async (req: AuthRequest, res: Response): Promise<void
   }
 };
 
+export const replacePhoto = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { photoId } = req.params;
+    const file = req.file;
+
+    if (!file) {
+      res.status(400).json({ error: 'No file uploaded' });
+      return;
+    }
+
+    const existingPhoto = await Photo.findOne({ _id: photoId, userId: req.user!.id });
+
+    if (!existingPhoto) {
+      res.status(404).json({ error: 'Photo not found' });
+      return;
+    }
+
+    const uploadResult = await uploadImage(file.buffer, `relun/users/${req.user!.id}`);
+
+    // if (existingPhoto.publicId) {
+    //   await deleteImage(existingPhoto.publicId);
+    // }
+
+    existingPhoto.url = uploadResult.secureUrl;
+    existingPhoto.publicId = uploadResult.publicId;
+    await existingPhoto.save();
+
+    res.json(existingPhoto);
+  } catch (error) {
+    console.error('Replace photo error:', error);
+    res.status(500).json({ error: 'Failed to replace photo' });
+  }
+};
+
 export const deletePhoto = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { photoId } = req.params;
@@ -283,9 +402,9 @@ export const deletePhoto = async (req: AuthRequest, res: Response): Promise<void
     }
 
     // Delete from Cloudinary if publicId exists
-    if (photo.publicId) {
-      await deleteImage(photo.publicId);
-    }
+    // if (photo.publicId) {
+    //   await deleteImage(photo.publicId);
+    // }
 
     // Delete from database
     await Photo.deleteOne({ _id: photoId });
@@ -330,6 +449,156 @@ export const getUserProfile = async (req: AuthRequest, res: Response): Promise<v
   }
 };
 
+export const likeUser = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      res.status(400).json({ errors: errors.array() });
+      return;
+    }
+
+    const { targetUserId } = req.params;
+    const userId = req.user!.id;
+
+    if (userId === targetUserId) {
+      res.status(400).json({ error: 'You cannot like yourself' });
+      return;
+    }
+
+    const targetUser = await User.findOne({ _id: targetUserId, isActive: true });
+
+    if (!targetUser) {
+      res.status(404).json({ error: 'Target user not found' });
+      return;
+    }
+
+    const [currentProfile, targetProfile] = await Promise.all([
+      Profile.findOne({ userId }).select('segment'),
+      Profile.findOne({ userId: targetUserId }).select('segment'),
+    ]);
+
+    if (
+      currentProfile?.segment &&
+      targetProfile?.segment &&
+      currentProfile.segment !== targetProfile.segment
+    ) {
+      res.status(403).json({ error: 'You can only like users in the same segment' });
+      return;
+    }
+
+    const existingLike = await Like.findOne({ userId, targetUserId });
+
+    if (!existingLike) {
+      await Like.create({ userId, targetUserId });
+    }
+
+    const reciprocalLikeExists = !!(await Like.exists({
+      userId: targetUserId,
+      targetUserId: userId,
+    }));
+
+    res.status(existingLike ? 200 : 201).json({
+      liked: true,
+      isMutual: reciprocalLikeExists,
+      alreadyLiked: !!existingLike,
+      targetUserId,
+    });
+  } catch (error) {
+    console.error('Like user error:', error);
+    res.status(500).json({ error: 'Failed to like user' });
+  }
+};
+
+export const unlikeUser = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      res.status(400).json({ errors: errors.array() });
+      return;
+    }
+
+    const { targetUserId } = req.params;
+    const userId = req.user!.id;
+
+    await Like.deleteOne({ userId, targetUserId });
+
+    res.json({ liked: false, targetUserId });
+  } catch (error) {
+    console.error('Unlike user error:', error);
+    res.status(500).json({ error: 'Failed to unlike user' });
+  }
+};
+
+export const getLikeStatus = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      res.status(400).json({ errors: errors.array() });
+      return;
+    }
+
+    const { targetUserId } = req.params;
+    const userId = req.user!.id;
+
+    const liked = !!(await Like.exists({ userId, targetUserId }));
+    const isMutual =
+      liked &&
+      !!(await Like.exists({
+        userId: targetUserId,
+        targetUserId: userId,
+      }));
+
+    res.json({ liked, isMutual, targetUserId });
+  } catch (error) {
+    console.error('Get like status error:', error);
+    res.status(500).json({ error: 'Failed to get like status' });
+  }
+};
+
+export const getReceivedLikes = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.id;
+    const { limit = 100 } = req.query;
+    const safeLimit = Math.max(1, Math.min(Number(limit), 200));
+
+    const likes = await Like.find({ targetUserId: userId })
+      .sort({ createdAt: -1 })
+      .limit(safeLimit)
+      .lean();
+
+    if (!likes || likes.length === 0) {
+      res.json({ likes: [] });
+      return;
+    }
+
+    const likesWithUsers = await Promise.all(
+      likes.map(async (like) => {
+        const [likerUser, likerProfile, likerPhotos] = await Promise.all([
+          User.findOne({ _id: like.userId, isActive: true }).select(
+            'fullName dateOfBirth gender lastActive'
+          ),
+          Profile.findOne({ userId: like.userId }).select('bio segment'),
+          Photo.find({ userId: like.userId }).sort({ order: 1 }),
+        ]);
+
+        return {
+          like,
+          user: likerUser,
+          profile: likerProfile,
+          photos: likerPhotos,
+        };
+      })
+    );
+
+    const validLikes = likesWithUsers.filter((item) => item.user !== null);
+
+    res.json({ likes: validLikes });
+  } catch (error) {
+    console.error('Get received likes error:', error);
+    res.status(500).json({ error: 'Failed to get received likes' });
+  }
+};
+
 // Get nearby users for discovery/feed
 export const getNearbyUsers = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -341,9 +610,11 @@ export const getNearbyUsers = async (req: AuthRequest, res: Response): Promise<v
 
     const { limit = 10, latitude, longitude } = req.query;
     const userId = req.user!.id;
+    const safeLimit = Math.max(1, Math.min(Number(limit), 50));
 
     // Get current user's profile
     let currentProfile = await Profile.findOne({ userId });
+    const currentSegment = currentProfile?.segment || 'relationship';
 
     // Auto-update user location if coordinates are provided (with throttling)
     if (latitude && longitude) {
@@ -392,22 +663,23 @@ export const getNearbyUsers = async (req: AuthRequest, res: Response): Promise<v
       }
     }
 
-    const query: any = {
-      _id: { $ne: userId },
-      isActive: true,
-    };
-
     // Add location-based filtering if available
     const hasLocation =
       currentProfile?.location?.coordinates ||
       (currentProfile?.latitude && currentProfile?.longitude);
 
     if (hasLocation && currentProfile) {
-      let userLocation;
+      let userLocation: { type: 'Point'; coordinates: [number, number] } | undefined;
 
       // Use GeoJSON location if available, otherwise convert lat/lng
       if (currentProfile.location?.coordinates) {
-        userLocation = currentProfile.location;
+        userLocation = {
+          type: 'Point',
+          coordinates: [
+            currentProfile.location.coordinates[0],
+            currentProfile.location.coordinates[1],
+          ],
+        };
       } else if (currentProfile.latitude && currentProfile.longitude) {
         userLocation = {
           type: 'Point',
@@ -415,41 +687,89 @@ export const getNearbyUsers = async (req: AuthRequest, res: Response): Promise<v
         };
       }
 
-      // Find profile documents within the distance
-      const nearbyProfileUserIds = await Profile.find({
-        location: {
-          $near: {
-            $geometry: userLocation,
-            $maxDistance: 500000, // 500km
+      if (!userLocation) {
+        res.json({ users: [] });
+        return;
+      }
+
+      // Default radius is 35km - show closest users first
+      const maxDistance = 35000; // 35km in meters
+
+      // Use aggregation to get profiles sorted by distance
+      const nearbyProfiles = await Profile.aggregate([
+        {
+          $geoNear: {
+            near: userLocation,
+            distanceField: 'distance',
+            maxDistance: maxDistance,
+            spherical: true,
+            query: {
+              userId: { $ne: new Types.ObjectId(userId) },
+              segment: currentSegment,
+              isVisible: true,
+            },
           },
         },
-      }).distinct('userId');
+        {
+          $sort: { distance: 1 }, // Sort by distance ascending (closest first)
+        },
+        {
+          $limit: safeLimit,
+        },
+      ]);
 
-      if (!nearbyProfileUserIds || nearbyProfileUserIds.length === 0) {
+      if (!nearbyProfiles || nearbyProfiles.length === 0) {
         res.json({ users: [] });
         return;
       }
 
-      // Filter out the current user
-      const filteredNearbyIds = nearbyProfileUserIds.filter((id) => id.toString() !== userId);
+      // Get user details and photos for each nearby profile
+      const usersWithProfiles = await Promise.all(
+        nearbyProfiles.map(async (profile) => {
+          const user = await User.findById(profile.userId).select(
+            'fullName dateOfBirth gender lastActive'
+          );
+          const photos = await Photo.find({ userId: profile.userId }).sort({ order: 1 });
+          return {
+            user,
+            profile: {
+              ...profile,
+              distance: Math.round(profile.distance / 1000), // Convert to km
+            },
+            photos,
+          };
+        })
+      );
 
-      if (filteredNearbyIds.length === 0) {
-        res.json({ users: [] });
-        return;
-      }
+      // Filter out any null users (in case user was deleted but profile remains)
+      const validUsers = usersWithProfiles.filter((item) => item.user !== null);
 
-      query._id = { $in: filteredNearbyIds };
+      res.json({ users: validUsers });
+      return;
     }
 
-    const users = await User.find(query)
-      .limit(Number(limit))
-      .select('fullName dateOfBirth gender lastActive');
+    // Fallback for users without location - return users in the same segment.
+    const segmentProfiles = await Profile.find({
+      userId: { $ne: new Types.ObjectId(userId) },
+      segment: currentSegment,
+      isVisible: true,
+    })
+      .limit(safeLimit)
+      .lean();
 
-    // Get profiles and photos for each user
+    if (!segmentProfiles || segmentProfiles.length === 0) {
+      res.json({ users: [] });
+      return;
+    }
+
+    // Get user details and photos for each matched segment profile.
     const usersWithProfiles = await Promise.all(
-      users.map(async (user) => {
-        const profile = await Profile.findOne({ userId: user._id });
-        const photos = await Photo.find({ userId: user._id }).sort({ order: 1 });
+      segmentProfiles.map(async (profile) => {
+        const user = await User.findOne({ _id: profile.userId, isActive: true }).select(
+          'fullName dateOfBirth gender lastActive'
+        );
+        const photos = await Photo.find({ userId: profile.userId }).sort({ order: 1 });
+
         return {
           user,
           profile,
@@ -458,7 +778,9 @@ export const getNearbyUsers = async (req: AuthRequest, res: Response): Promise<v
       })
     );
 
-    res.json({ users: usersWithProfiles });
+    const validUsers = usersWithProfiles.filter((item) => item.user !== null);
+
+    res.json({ users: validUsers });
   } catch (error) {
     console.error('Get nearby users error:', error);
     res.status(500).json({ error: 'Failed to get nearby users' });

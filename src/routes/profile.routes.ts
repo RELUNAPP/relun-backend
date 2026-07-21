@@ -1,15 +1,20 @@
 import { Router } from 'express';
-import { body, query } from 'express-validator';
+import { body, param, query } from 'express-validator';
 import { authenticate } from '../middleware/auth.middleware';
 import { upload } from '../middleware/upload.middleware';
 import {
   getProfile,
   updateProfile,
   uploadPhoto,
+  replacePhoto,
   deletePhoto,
   getUserProfile,
   getNearbyUsers,
   completeProfile,
+  likeUser,
+  unlikeUser,
+  getLikeStatus,
+  getReceivedLikes,
 } from '../controllers/profile.controller';
 
 const router = Router();
@@ -22,6 +27,7 @@ router.put(
   '/',
   authenticate,
   [
+    body('fullName').optional().isString().trim().isLength({ min: 1, max: 100 }),
     body('bio').optional().isString().isLength({ max: 500 }),
     body('city').optional().isString(),
     body('segment').optional().isIn(['relationship', 'fun']),
@@ -35,6 +41,9 @@ router.put(
 
 // Upload photo (supports single or multiple files, max 3 total)
 router.post('/photos', authenticate, upload.array('photos', 3), uploadPhoto);
+
+// Replace an existing photo
+router.patch('/photos/:photoId', authenticate, upload.single('photo'), replacePhoto);
 // router.post('/photos', authenticate, upload.fields([
 //   { name: 'photo', maxCount: 1 },
 //   { name: 'photos', maxCount: 6 }
@@ -57,6 +66,30 @@ router.get(
   ],
   getNearbyUsers
 );
+
+// Like/unlike a user
+router.post(
+  '/likes/:targetUserId',
+  authenticate,
+  [param('targetUserId').isMongoId().withMessage('Invalid target user ID')],
+  likeUser
+);
+
+router.delete(
+  '/likes/:targetUserId',
+  authenticate,
+  [param('targetUserId').isMongoId().withMessage('Invalid target user ID')],
+  unlikeUser
+);
+
+router.get(
+  '/likes/:targetUserId/status',
+  authenticate,
+  [param('targetUserId').isMongoId().withMessage('Invalid target user ID')],
+  getLikeStatus
+);
+
+router.get('/likes/received', authenticate, getReceivedLikes);
 
 // Get another user's profile
 router.get('/:userId', authenticate, getUserProfile);

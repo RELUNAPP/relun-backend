@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { User } from '../models/User';
+import { verifyToken } from '../utils/jwt.utils';
 
 export interface AuthRequest extends Request {
   user?: {
@@ -24,15 +25,7 @@ export const authenticate = async (
     }
 
     const token = authHeader.substring(7);
-    const secret = process.env.JWT_SECRET;
-
-    if (!secret) {
-      console.error('[AUTH] JWT_SECRET not configured');
-      res.status(500).json({ error: 'Server configuration error' });
-      return;
-    }
-
-    const decoded = jwt.verify(token, secret) as { userId: string };
+    const decoded = verifyToken(token) as { userId: string };
     console.log('[AUTH] Decoded token:', { userId: decoded.userId });
 
     const user = await User.findById(decoded.userId).select('email phone isActive');
@@ -70,7 +63,7 @@ export const authenticate = async (
 
 export const optionalAuth = async (
   req: AuthRequest,
-  res: Response,
+  _res: Response,
   next: NextFunction
 ): Promise<void> => {
   try {
@@ -78,19 +71,16 @@ export const optionalAuth = async (
 
     if (authHeader && authHeader.startsWith('Bearer ')) {
       const token = authHeader.substring(7);
-      const secret = process.env.JWT_SECRET;
 
-      if (secret) {
-        const decoded = jwt.verify(token, secret) as { userId: string };
-        const user = await User.findById(decoded.userId).select('email phone isActive');
+      const decoded = verifyToken(token) as { userId: string };
+      const user = await User.findById(decoded.userId).select('email phone isActive');
 
-        if (user && user.isActive) {
-          req.user = {
-            id: user._id.toString(),
-            email: user.email || undefined,
-            phone: user.phone || undefined,
-          };
-        }
+      if (user && user.isActive) {
+        req.user = {
+          id: user._id.toString(),
+          email: user.email || undefined,
+          phone: user.phone || undefined,
+        };
       }
     }
 
