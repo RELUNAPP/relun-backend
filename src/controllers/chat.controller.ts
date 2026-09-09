@@ -1,9 +1,13 @@
 import { Response } from 'express';
+import mongoose from 'mongoose';
 import { validationResult } from 'express-validator';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { Message, getConversationId } from '../models/Message';
+import { isMatched } from '../models/Like';
 import { User } from '../models/User';
 import { GetMessagesResponse, SendMessageRequest, UnreadCountResponse } from '../types';
+
+const isValidObjectId = (id: string): boolean => mongoose.Types.ObjectId.isValid(id);
 
 export const getMessages = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -11,17 +15,26 @@ export const getMessages = async (req: AuthRequest, res: Response): Promise<void
     const { page = 1, limit = 50 } = req.query;
     const userId = req.user!.id;
 
+    if (!isValidObjectId(recipientId)) {
+      res.status(400).json({ error: 'Invalid recipient id' });
+      return;
+    }
+
+    if (!(await isMatched(userId, recipientId))) {
+      res.status(403).json({ error: 'You can only chat with your matches' });
+      return;
+    }
+
     // Generate conversation ID from the two user IDs
     const conversationId = getConversationId(userId, recipientId);
 
-    const messages = await Message.find({ conversationId })
-      .sort({ createdAt: -1 })
-      .skip((Number(page) - 1) * Number(limit))
-      .limit(Number(limit))
-      .populate('senderId', 'fullName')
-      .populate('receiverId', 'fullName');
-
-    const total = await Message.countDocuments({ conversationId });
+    const [messages, total] = await Promise.all([
+      Message.find({ conversationId })
+        .sort({ createdAt: -1 })
+        .skip((Number(page) - 1) * Number(limit))
+        .limit(Number(limit)),
+      Message.countDocuments({ conversationId }),
+    ]);
 
     // Mark messages as read
     await Message.updateMany(
@@ -58,10 +71,14 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
     const { content, messageType = 'text' }: SendMessageRequest = req.body;
     const userId = req.user!.id;
 
-    // Verify recipient exists
-    const recipient = await User.findById(recipientId);
-    if (!recipient) {
-      res.status(404).json({ error: 'Recipient not found' });
+    if (!isValidObjectId(recipientId)) {
+      res.status(400).json({ error: 'Invalid recipient id' });
+      return;
+    }
+
+    // Replaces the old "recipient exists" check: a match implies both users exist.
+    if (!(await isMatched(userId, recipientId))) {
+      res.status(403).json({ error: 'You can only chat with your matches' });
       return;
     }
 
@@ -76,11 +93,7 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
       messageType,
     });
 
-    const populatedMessage = await Message.findById(message._id)
-      .populate('senderId', 'fullName')
-      .populate('receiverId', 'fullName');
-
-    res.status(201).json(populatedMessage);
+    res.status(201).json(message);
   } catch (error) {
     console.error('Send message error:', error);
     res.status(500).json({ error: 'Failed to send message' });
@@ -92,20 +105,24 @@ export const deleteMessage = async (req: AuthRequest, res: Response): Promise<vo
     const { recipientId, messageId } = req.params;
     const userId = req.user!.id;
 
+    if (!isValidObjectId(recipientId) || !isValidObjectId(messageId)) {
+      res.status(400).json({ error: 'Invalid id' });
+      return;
+    }
+
     const conversationId = getConversationId(userId, recipientId);
 
-    const message = await Message.findOne({
+    // Scoped to senderId, so a user can only delete their own messages.
+    const result = await Message.deleteOne({
       _id: messageId,
       conversationId,
       senderId: userId,
     });
 
-    if (!message) {
+    if (result.deletedCount === 0) {
       res.status(404).json({ error: 'Message not found' });
       return;
     }
-
-    await Message.deleteOne({ _id: messageId });
 
     res.json({ message: 'Message deleted successfully' });
   } catch (error) {
@@ -134,12 +151,15 @@ export const getUnreadCount = async (req: AuthRequest, res: Response): Promise<v
 export const getConversations = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
+    // Aggregation pipelines are not cast by Mongoose, so the id must be an
+    // ObjectId here or every $match and $eq below silently matches nothing.
+    const userObjectId = new mongoose.Types.ObjectId(userId);
 
     // Get all unique conversations for this user
     const conversations = await Message.aggregate([
       {
         $match: {
-          $or: [{ senderId: userId }, { receiverId: userId }],
+          $or: [{ senderId: userObjectId }, { receiverId: userObjectId }],
         },
       },
       {
@@ -152,7 +172,7 @@ export const getConversations = async (req: AuthRequest, res: Response): Promise
           unreadCount: {
             $sum: {
               $cond: [
-                { $and: [{ $eq: ['$receiverId', userId] }, { $eq: ['$isRead', false] }] },
+                { $and: [{ $eq: ['$receiverId', userObjectId] }, { $eq: ['$isRead', false] }] },
                 1,
                 0,
               ],
@@ -165,24 +185,22 @@ export const getConversations = async (req: AuthRequest, res: Response): Promise
       },
     ]);
 
-    // Get the other user details for each conversation
-    const conversationsWithUsers = await Promise.all(
-      conversations.map(async (conv) => {
-        const otherUserId =
-          conv.lastMessage.senderId.toString() === userId
-            ? conv.lastMessage.receiverId
-            : conv.lastMessage.senderId;
-
-        const otherUser = await User.findById(otherUserId).select('fullName email');
-
-        return {
-          conversationId: conv._id,
-          otherUser,
-          lastMessage: conv.lastMessage,
-          unreadCount: conv.unreadCount,
-        };
-      })
+    // Fetch every participant in one query rather than one per conversation.
+    const otherUserIds = conversations.map((conv) =>
+      conv.lastMessage.senderId.equals(userObjectId)
+        ? conv.lastMessage.receiverId
+        : conv.lastMessage.senderId
     );
+
+    const users = await User.find({ _id: { $in: otherUserIds } }).select('fullName email');
+    const usersById = new Map(users.map((user) => [user._id.toString(), user]));
+
+    const conversationsWithUsers = conversations.map((conv, index) => ({
+      conversationId: conv._id,
+      otherUser: usersById.get(otherUserIds[index].toString()) ?? null,
+      lastMessage: conv.lastMessage,
+      unreadCount: conv.unreadCount,
+    }));
 
     res.json({ conversations: conversationsWithUsers });
   } catch (error) {

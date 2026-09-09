@@ -18,3 +18,31 @@ const likeSchema = new Schema<ILike>(
 likeSchema.index({ userId: 1, targetUserId: 1 }, { unique: true });
 
 export const Like = mongoose.model<ILike>('Like', likeSchema);
+
+// Two users are matched when both have liked each other. Chat is gated on this:
+// without it, any authenticated user could message any userId they can guess.
+export const isMatched = async (userId1: string, userId2: string): Promise<boolean> => {
+  if (userId1 === userId2) return false;
+
+  const mutualLikes = await Like.countDocuments({
+    $or: [
+      { userId: userId1, targetUserId: userId2 },
+      { userId: userId2, targetUserId: userId1 },
+    ],
+  });
+
+  return mutualLikes === 2;
+};
+
+// Every user this user has matched with, in two indexed queries rather than
+// one per candidate.
+export const getMatchedUserIds = async (userId: string): Promise<string[]> => {
+  const [liked, likedBy] = await Promise.all([
+    Like.find({ userId }).select('targetUserId').lean(),
+    Like.find({ targetUserId: userId }).select('userId').lean(),
+  ]);
+
+  const likedIds = new Set(liked.map((like) => like.targetUserId.toString()));
+
+  return likedBy.map((like) => like.userId.toString()).filter((id) => likedIds.has(id));
+};

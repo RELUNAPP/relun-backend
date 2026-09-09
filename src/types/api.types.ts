@@ -215,3 +215,8 @@ export interface SocketMessagesReadEvent {
   conversationId: string;
   readBy: string;
 }
+
+export interface SocketPresenceEvent {
+  userId: string;
+  isOnline: boolean;
+}

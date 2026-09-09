@@ -5,9 +5,10 @@ import { AuthRequest } from '../middleware/auth.middleware';
 import { User } from '../models/User';
 import { Profile } from '../models/Profile';
 import { Photo } from '../models/Photo';
-import { Like } from '../models/Like';
+import { Like, getMatchedUserIds } from '../models/Like';
 import { uploadImage, uploadMultipleImages } from '../services/cloudinary.service';
 import { calculateDistance } from '../utils/helpers';
+import { notifyNewMatch } from '../services/push.service';
 import {
   CompleteProfileRequest,
   ProfileUpdateData,
@@ -497,6 +498,12 @@ export const likeUser = async (req: AuthRequest, res: Response): Promise<void> =
       targetUserId: userId,
     }));
 
+    // Only when the match is newly formed. The liker sees isMutual in this
+    // response; the other side liked earlier and has no idea yet, so push them.
+    if (!existingLike && reciprocalLikeExists) {
+      void notifyNewMatch({ recipientId: targetUserId, matchedUserId: userId });
+    }
+
     res.status(existingLike ? 200 : 201).json({
       liked: true,
       isMutual: reciprocalLikeExists,
@@ -596,6 +603,59 @@ export const getReceivedLikes = async (req: AuthRequest, res: Response): Promise
   } catch (error) {
     console.error('Get received likes error:', error);
     res.status(500).json({ error: 'Failed to get received likes' });
+  }
+};
+
+// Users this user has matched with (both sides liked each other).
+export const getMatches = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.id;
+    const matchedUserIds = await getMatchedUserIds(userId);
+
+    if (matchedUserIds.length === 0) {
+      res.json({ matches: [] });
+      return;
+    }
+
+    // Three queries total no matter how many matches, rather than three each.
+    const [users, profiles, photos] = await Promise.all([
+      User.find({ _id: { $in: matchedUserIds }, isActive: true }).select(
+        'fullName dateOfBirth gender lastActive'
+      ),
+      Profile.find({ userId: { $in: matchedUserIds } }).select('userId bio segment'),
+      Photo.find({ userId: { $in: matchedUserIds } }).sort({ order: 1 }),
+    ]);
+
+    const profileByUserId = new Map(
+      profiles.map((profile) => [profile.userId.toString(), profile])
+    );
+
+    const photosByUserId = new Map<string, typeof photos>();
+    photos.forEach((photo) => {
+      const key = photo.userId.toString();
+      const existing = photosByUserId.get(key);
+
+      if (existing) {
+        existing.push(photo);
+      } else {
+        photosByUserId.set(key, [photo]);
+      }
+    });
+
+    const matches = users.map((user) => {
+      const key = (user._id as Types.ObjectId).toString();
+
+      return {
+        user,
+        profile: profileByUserId.get(key) || null,
+        photos: photosByUserId.get(key) || [],
+      };
+    });
+
+    res.json({ matches });
+  } catch (error) {
+    console.error('Get matches error:', error);
+    res.status(500).json({ error: 'Failed to get matches' });
   }
 };
 

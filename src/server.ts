@@ -16,6 +16,7 @@ configureCloudinary();
 import authRoutes from './routes/auth.routes';
 import profileRoutes from './routes/profile.routes';
 import chatRoutes from './routes/chat.routes';
+import notificationRoutes from './routes/notification.routes';
 
 // Import socket handler
 import { initializeSocketIO } from './socket/chat.socket';
@@ -62,6 +63,7 @@ app.get('/health', (_req: Request, res: Response) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/profiles', profileRoutes);
 app.use('/api/chat', chatRoutes);
+app.use('/api/notifications', notificationRoutes);
 
 // 404 handler
 app.use((_req: Request, res: Response) => {

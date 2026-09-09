@@ -15,6 +15,7 @@ import {
   unlikeUser,
   getLikeStatus,
   getReceivedLikes,
+  getMatches,
 } from '../controllers/profile.controller';
 
 const router = Router();
@@ -90,6 +91,9 @@ router.get(
 );
 
 router.get('/likes/received', authenticate, getReceivedLikes);
+
+// Mutual matches. Must stay above '/:userId' or that route swallows it.
+router.get('/matches', authenticate, getMatches);
 
 // Get another user's profile
 router.get('/:userId', authenticate, getUserProfile);

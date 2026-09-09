@@ -1,6 +1,13 @@
 import { Server, Socket } from 'socket.io';
 import { verifyToken } from '../utils/jwt.utils';
-import { Message, getConversationId } from '../models/Message';
+import {
+  Message,
+  getConversationId,
+  MAX_MESSAGE_LENGTH,
+  MESSAGE_TYPES,
+  MessageType,
+} from '../models/Message';
+import { isMatched, getMatchedUserIds } from '../models/Like';
 import { User } from '../models/User';
 import {
   SocketSendMessageData,
@@ -9,11 +16,32 @@ import {
   SocketNewMessageEvent,
   SocketUserTypingEvent,
   SocketMessagesReadEvent,
+  SocketPresenceEvent,
 } from '../types';
+import { addConnection, removeConnection, isUserOnline } from './presence';
+import { notifyNewMessage } from '../services/push.service';
 
 interface AuthenticatedSocket extends Socket {
   userId?: string;
 }
+
+const isValidObjectId = (id: unknown): id is string =>
+  typeof id === 'string' && /^[0-9a-fA-F]{24}$/.test(id);
+
+// Presence is only shared with people the user has matched with, so it is
+// pushed into each match's personal room rather than broadcast to everyone.
+const broadcastPresence = async (io: Server, userId: string, isOnline: boolean) => {
+  try {
+    const matchedUserIds = await getMatchedUserIds(userId);
+    const event: SocketPresenceEvent = { userId, isOnline };
+
+    matchedUserIds.forEach((matchedUserId) => {
+      io.to(`user:${matchedUserId}`).emit('presence_changed', event);
+    });
+  } catch (error) {
+    console.error('Broadcast presence error:', error);
+  }
+};
 
 export const initializeSocketIO = (io: Server) => {
   // Authentication middleware
@@ -36,79 +64,126 @@ export const initializeSocketIO = (io: Server) => {
   });
 
   io.on('connection', (socket: AuthenticatedSocket) => {
-    console.log('[User connected]====>>', socket.userId);
+    const userId = socket.userId;
 
-    // Update user's online status
-    if (socket.userId) {
-      User.findByIdAndUpdate(socket.userId, { lastActive: new Date() }).catch(console.error);
+    if (!userId) {
+      socket.disconnect(true);
+      return;
     }
 
+    console.log('[User connected]====>>', userId);
+
+    // Update user's online status
+    User.findByIdAndUpdate(userId, { lastActive: new Date() }).catch(console.error);
+
     // Join user's room
-    socket.join(`user:${socket.userId}`);
+    socket.join(`user:${userId}`);
+
+    if (addConnection(userId)) {
+      void broadcastPresence(io, userId, true);
+    }
 
     // Join conversation room
     socket.on('join_conversation', async (recipientId: string) => {
       try {
-        if (socket.userId) {
-          const conversationId = getConversationId(socket.userId, recipientId);
-          socket.join(`conversation:${conversationId}`);
-          console.log(`User ${socket.userId} joined conversation ${conversationId}`);
+        if (!isValidObjectId(recipientId)) {
+          socket.emit('error', { message: 'Invalid recipient' });
+          return;
         }
+
+        // Gate the room itself, not just sends: room members receive typing
+        // and read-receipt events for the conversation.
+        if (!(await isMatched(userId, recipientId))) {
+          socket.emit('error', { message: 'You can only chat with your matches' });
+          return;
+        }
+
+        const conversationId = getConversationId(userId, recipientId);
+        socket.join(`conversation:${conversationId}`);
+
+        // Seed the opener with the current state; later changes arrive as
+        // presence_changed on the user's own room.
+        const presenceEvent: SocketPresenceEvent = {
+          userId: recipientId,
+          isOnline: isUserOnline(recipientId),
+        };
+        socket.emit('presence_changed', presenceEvent);
+
+        console.log(`User ${userId} joined conversation ${conversationId}`);
       } catch (error) {
         console.error('Join conversation error:', error);
+        socket.emit('error', { message: 'Failed to join conversation' });
       }
     });
 
     // Leave conversation room
     socket.on('leave_conversation', (recipientId: string) => {
-      if (socket.userId) {
-        const conversationId = getConversationId(socket.userId, recipientId);
-        socket.leave(`conversation:${conversationId}`);
-        console.log(`User ${socket.userId} left conversation ${conversationId}`);
-      }
+      if (!isValidObjectId(recipientId)) return;
+      const conversationId = getConversationId(userId, recipientId);
+      socket.leave(`conversation:${conversationId}`);
+      console.log(`User ${userId} left conversation ${conversationId}`);
     });
 
     // Send message
     socket.on('send_message', async (data: SocketSendMessageData) => {
       try {
-        const { recipientId, content, messageType = 'text' } = data;
+        const { recipientId, messageType = 'text' } = data ?? {};
+        const content = typeof data?.content === 'string' ? data.content.trim() : '';
 
-        if (!socket.userId) {
-          socket.emit('error', { message: 'Not authenticated' });
+        if (!isValidObjectId(recipientId)) {
+          socket.emit('error', { message: 'Invalid recipient' });
           return;
         }
 
-        // Verify recipient exists
-        const recipient = await User.findById(recipientId);
-        if (!recipient) {
-          socket.emit('error', { message: 'Recipient not found' });
+        if (!content) {
+          socket.emit('error', { message: 'Message content is required' });
           return;
         }
 
-        const conversationId = getConversationId(socket.userId, recipientId);
+        if (content.length > MAX_MESSAGE_LENGTH) {
+          socket.emit('error', {
+            message: `Message cannot exceed ${MAX_MESSAGE_LENGTH} characters`,
+          });
+          return;
+        }
 
-        // Create message
+        if (!MESSAGE_TYPES.includes(messageType as MessageType)) {
+          socket.emit('error', { message: 'Invalid message type' });
+          return;
+        }
+
+        // Replaces the old "recipient exists" check: a match implies both users exist.
+        if (!(await isMatched(userId, recipientId))) {
+          socket.emit('error', { message: 'You can only chat with your matches' });
+          return;
+        }
+
+        const conversationId = getConversationId(userId, recipientId);
+
         const message = await Message.create({
           conversationId,
-          senderId: socket.userId,
+          senderId: userId,
           receiverId: recipientId,
           content,
           messageType,
         });
 
-        const populatedMessage = await Message.findById(message._id)
-          .populate('senderId', 'fullName')
-          .populate('receiverId', 'fullName');
-
-        // Emit to conversation room
         const newMessageEvent: SocketNewMessageEvent = {
           conversationId,
-          message: populatedMessage as any,
+          message: message.toJSON() as any,
         };
+
+        // Emit to conversation room
         io.to(`conversation:${conversationId}`).emit('new_message', newMessageEvent);
 
         // Emit to receiver's room for notification
         io.to(`user:${recipientId}`).emit('message_notification', newMessageEvent);
+
+        // Only push when they have no live connection: someone with the app
+        // open already got the event above, and a push would just duplicate it.
+        if (!isUserOnline(recipientId)) {
+          void notifyNewMessage({ recipientId, senderId: userId, content });
+        }
       } catch (error) {
         console.error('Send message error:', error);
         socket.emit('error', { message: 'Failed to send message' });
@@ -116,57 +191,47 @@ export const initializeSocketIO = (io: Server) => {
     });
 
     // Typing indicator
-    socket.on('typing', async (data: SocketTypingData) => {
-      try {
-        const { recipientId, isTyping } = data;
+    socket.on('typing', (data: SocketTypingData) => {
+      const { recipientId, isTyping } = data ?? {};
+      if (!isValidObjectId(recipientId)) return;
 
-        if (socket.userId) {
-          const conversationId = getConversationId(socket.userId, recipientId);
-          const typingEvent: SocketUserTypingEvent = {
-            userId: socket.userId,
-            isTyping,
-          };
-          socket.to(`conversation:${conversationId}`).emit('user_typing', typingEvent);
-        }
-      } catch (error) {
-        console.error('Typing error:', error);
-      }
+      // No match check: only members of the room receive this, and join_conversation
+      // already gates membership.
+      const conversationId = getConversationId(userId, recipientId);
+      const typingEvent: SocketUserTypingEvent = { userId, isTyping: !!isTyping };
+      socket.to(`conversation:${conversationId}`).emit('user_typing', typingEvent);
     });
 
     // Mark messages as read
     socket.on('mark_read', async (data: SocketMarkReadData) => {
       try {
-        const { recipientId } = data;
+        const { recipientId } = data ?? {};
+        if (!isValidObjectId(recipientId)) return;
 
-        if (socket.userId) {
-          const conversationId = getConversationId(socket.userId, recipientId);
+        const conversationId = getConversationId(userId, recipientId);
 
-          await Message.updateMany(
-            { conversationId, receiverId: socket.userId, isRead: false },
-            { $set: { isRead: true, readAt: new Date() } }
-          );
+        // Scoped to messages addressed to this user, so it can only ever
+        // mark their own messages read.
+        await Message.updateMany(
+          { conversationId, receiverId: userId, isRead: false },
+          { $set: { isRead: true, readAt: new Date() } }
+        );
 
-          // Notify sender
-          const readEvent: SocketMessagesReadEvent = {
-            conversationId,
-            readBy: socket.userId,
-          };
-          socket.to(`conversation:${conversationId}`).emit('messages_read', readEvent);
-        }
+        // Notify sender
+        const readEvent: SocketMessagesReadEvent = { conversationId, readBy: userId };
+        socket.to(`conversation:${conversationId}`).emit('messages_read', readEvent);
       } catch (error) {
         console.error('Mark read error:', error);
       }
     });
 
     // Handle disconnect
-    socket.on('disconnect', async () => {
-      console.log('User disconnected:', socket.userId);
+    socket.on('disconnect', () => {
+      console.log('User disconnected:', userId);
+      User.findByIdAndUpdate(userId, { lastActive: new Date() }).catch(console.error);
 
-      // Update last active
-      if (socket.userId) {
-        await User.findByIdAndUpdate(socket.userId, { lastActive: new Date() }).catch(
-          console.error
-        );
+      if (removeConnection(userId)) {
+        void broadcastPresence(io, userId, false);
       }
     });
   });

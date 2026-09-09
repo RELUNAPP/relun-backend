@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { body } from 'express-validator';
+import { MAX_MESSAGE_LENGTH, MESSAGE_TYPES } from '../models/Message';
 import { authenticate } from '../middleware/auth.middleware';
 import {
   getMessages,
@@ -25,11 +26,13 @@ router.post(
   '/:recipientId',
   authenticate,
   [
-    body('content').notEmpty().withMessage('Message content is required'),
-    body('messageType')
-      .optional()
-      .isIn(['text', 'image', 'video', 'audio'])
-      .withMessage('Invalid message type'),
+    body('content')
+      .trim()
+      .notEmpty()
+      .withMessage('Message content is required')
+      .isLength({ max: MAX_MESSAGE_LENGTH })
+      .withMessage(`Message cannot exceed ${MAX_MESSAGE_LENGTH} characters`),
+    body('messageType').optional().isIn(MESSAGE_TYPES).withMessage('Invalid message type'),
   ],
   sendMessage
 );
