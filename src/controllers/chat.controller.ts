@@ -3,7 +3,13 @@ import mongoose from 'mongoose';
 import { validationResult } from 'express-validator';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { Message, getConversationId } from '../models/Message';
-import { isMatched } from '../models/Like';
+import { getBlockedUserIds } from '../models/Block';
+import {
+  canViewConversation,
+  getChatAccess,
+  CHAT_ACCESS_ERRORS,
+  unlockedConversationIds,
+} from '../services/access.service';
 import { User } from '../models/User';
 import { GetMessagesResponse, SendMessageRequest, UnreadCountResponse } from '../types';
 
@@ -20,7 +26,7 @@ export const getMessages = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    if (!(await isMatched(userId, recipientId))) {
+    if (!(await canViewConversation(userId, recipientId))) {
       res.status(403).json({ error: 'You can only chat with your matches' });
       return;
     }
@@ -76,9 +82,10 @@ export const sendMessage = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    // Replaces the old "recipient exists" check: a match implies both users exist.
-    if (!(await isMatched(userId, recipientId))) {
-      res.status(403).json({ error: 'You can only chat with your matches' });
+    // A match implies both users exist; blocks and unpaid chats are refused too.
+    const access = await getChatAccess(userId, recipientId);
+    if (access !== 'ok') {
+      res.status(403).json({ error: CHAT_ACCESS_ERRORS[access], code: access.toUpperCase() });
       return;
     }
 
@@ -192,15 +199,23 @@ export const getConversations = async (req: AuthRequest, res: Response): Promise
         : conv.lastMessage.senderId
     );
 
-    const users = await User.find({ _id: { $in: otherUserIds } }).select('fullName email');
+    const [users, blockedIds, unlocked] = await Promise.all([
+      User.find({ _id: { $in: otherUserIds }, isActive: true }).select('fullName'),
+      getBlockedUserIds(userId),
+      unlockedConversationIds(conversations.map((conv) => conv._id)),
+    ]);
     const usersById = new Map(users.map((user) => [user._id.toString(), user]));
+    const blocked = new Set(blockedIds);
 
-    const conversationsWithUsers = conversations.map((conv, index) => ({
-      conversationId: conv._id,
-      otherUser: usersById.get(otherUserIds[index].toString()) ?? null,
-      lastMessage: conv.lastMessage,
-      unreadCount: conv.unreadCount,
-    }));
+    const conversationsWithUsers = conversations
+      .map((conv, index) => ({
+        conversationId: conv._id,
+        otherUser: usersById.get(otherUserIds[index].toString()) ?? null,
+        lastMessage: conv.lastMessage,
+        unreadCount: conv.unreadCount,
+        chatUnlocked: unlocked.has(conv._id),
+      }))
+      .filter((conv) => conv.otherUser && !blocked.has(conv.otherUser._id.toString()));
 
     res.json({ conversations: conversationsWithUsers });
   } catch (error) {

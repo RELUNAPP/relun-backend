@@ -1,10 +1,14 @@
 import { PushToken } from '../models/PushToken';
 import { User } from '../models/User';
 import { Message } from '../models/Message';
+import { Profile } from '../models/Profile';
+import { getFirebaseMessaging } from './firebase.service';
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 // Expo accepts at most 100 messages per request.
 const EXPO_BATCH_SIZE = 100;
+// FCM multicast accepts at most 500 tokens per call.
+const FCM_BATCH_SIZE = 500;
 const PREVIEW_LENGTH = 120;
 
 export type PushPayload = {
@@ -78,6 +82,52 @@ const deliver = async (tokens: string[], payload: PushPayload): Promise<void> =>
   }
 };
 
+// FCM data values must be strings.
+const stringifyData = (data?: Record<string, unknown>): Record<string, string> =>
+  Object.fromEntries(
+    Object.entries(data ?? {})
+      .filter(([, value]) => value !== undefined && value !== null)
+      .map(([key, value]) => [key, typeof value === 'string' ? value : JSON.stringify(value)])
+  );
+
+const deliverFcm = async (tokens: string[], payload: PushPayload): Promise<void> => {
+  const messaging = getFirebaseMessaging();
+
+  if (!messaging) {
+    console.warn('[push] FCM tokens registered but Firebase is not configured');
+    return;
+  }
+
+  const response = await messaging.sendEachForMulticast({
+    tokens,
+    notification: { title: payload.title, body: payload.body },
+    data: stringifyData(payload.data),
+    android: {
+      priority: 'high',
+      notification: {
+        channelId: 'messages',
+        sound: 'default',
+        notificationCount: payload.badge,
+      },
+    },
+  });
+
+  // Same idea as Expo's DeviceNotRegistered: drop tokens of uninstalled apps.
+  const deadTokens = response.responses
+    .map((result, index) => {
+      const code = result.error?.code;
+      return code === 'messaging/registration-token-not-registered' ||
+        code === 'messaging/invalid-registration-token'
+        ? tokens[index]
+        : null;
+    })
+    .filter((token): token is string => !!token);
+
+  if (deadTokens.length > 0) {
+    await PushToken.deleteMany({ token: { $in: deadTokens } });
+  }
+};
+
 /**
  * Fire-and-forget. A push that fails is not worth retrying: the message is
  * already in MongoDB and the user sees it on next open, and a stale
@@ -86,17 +136,27 @@ const deliver = async (tokens: string[], payload: PushPayload): Promise<void> =>
  */
 export const sendPushToUser = async (userId: string, payload: PushPayload): Promise<void> => {
   try {
-    const tokens = await PushToken.find({ userId }).select('token').lean();
+    const profile = await Profile.findOne({ userId }).select('notificationsEnabled').lean();
+
+    if (profile?.notificationsEnabled === false) {
+      return;
+    }
+
+    const tokens = await PushToken.find({ userId }).select('token provider').lean();
 
     if (tokens.length === 0) {
       return;
     }
 
-    for (const batch of chunk(
-      tokens.map((entry) => entry.token),
-      EXPO_BATCH_SIZE
-    )) {
+    const expoTokens = tokens.filter((entry) => entry.provider !== 'fcm').map((e) => e.token);
+    const fcmTokens = tokens.filter((entry) => entry.provider === 'fcm').map((e) => e.token);
+
+    for (const batch of chunk(expoTokens, EXPO_BATCH_SIZE)) {
       await deliver(batch, payload);
+    }
+
+    for (const batch of chunk(fcmTokens, FCM_BATCH_SIZE)) {
+      await deliverFcm(batch, payload);
     }
   } catch (error) {
     console.error('Send push error:', error);
@@ -144,4 +204,32 @@ export const notifyNewMatch = async (params: {
   } catch (error) {
     console.error('Notify new match error:', error);
   }
+};
+
+export const notifyDateRequest = async (params: {
+  ownerId: string;
+  requesterId: string;
+  activity: string;
+}): Promise<void> => {
+  const requester = await User.findById(params.requesterId).select('fullName').lean();
+
+  await sendPushToUser(params.ownerId, {
+    title: 'New date request',
+    body: `${requester?.fullName?.split(' ')[0] || 'Someone'} wants to join "${params.activity}".`,
+    data: { type: 'date_request', userId: params.requesterId },
+  });
+};
+
+export const notifyDateAccepted = async (params: {
+  requesterId: string;
+  ownerId: string;
+  activity: string;
+}): Promise<void> => {
+  const owner = await User.findById(params.ownerId).select('fullName').lean();
+
+  await sendPushToUser(params.requesterId, {
+    title: 'Date accepted',
+    body: `${owner?.fullName?.split(' ')[0] || 'They'} accepted you for "${params.activity}". Say hello!`,
+    data: { type: 'match', userId: params.ownerId },
+  });
 };

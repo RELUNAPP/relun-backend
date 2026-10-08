@@ -1,0 +1,76 @@
+import { GoogleAuth } from 'google-auth-library';
+
+/**
+ * Checks a Google Play one-time product purchase with the Android Publisher API.
+ *
+ * Needs:
+ *   ANDROID_PACKAGE_NAME             e.g. com.relun.app
+ *   GOOGLE_PLAY_SERVICE_ACCOUNT_PATH path to a service-account JSON key that
+ *                                    has access in Play Console > API access
+ *
+ * Without the key, purchases are accepted unverified outside production only,
+ * so testing on an emulator works but a production server never mints coins
+ * for an unchecked token.
+ */
+
+type ProductPurchase = {
+  purchaseState?: number; // 0 purchased, 1 cancelled, 2 pending
+  consumptionState?: number; // 0 not yet consumed, 1 consumed
+  orderId?: string;
+};
+
+export type VerifyResult = { ok: true; orderId?: string } | { ok: false; reason: string };
+
+let auth: GoogleAuth | null = null;
+
+const getAuth = (): GoogleAuth | null => {
+  const keyFile = process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_PATH;
+  if (!keyFile) return null;
+
+  if (!auth) {
+    auth = new GoogleAuth({
+      keyFile,
+      scopes: ['https://www.googleapis.com/auth/androidpublisher'],
+    });
+  }
+
+  return auth;
+};
+
+export const verifyPlayPurchase = async (
+  productId: string,
+  purchaseToken: string
+): Promise<VerifyResult> => {
+  const googleAuth = getAuth();
+  const packageName = process.env.ANDROID_PACKAGE_NAME || 'com.relun.app';
+
+  if (!googleAuth) {
+    if (process.env.NODE_ENV === 'production') {
+      return { ok: false, reason: 'Purchase verification is not configured' };
+    }
+    console.warn(
+      '[billing] GOOGLE_PLAY_SERVICE_ACCOUNT_PATH not set; accepting unverified purchase'
+    );
+    return { ok: true };
+  }
+
+  try {
+    const client = await googleAuth.getClient();
+    const url =
+      `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/` +
+      `${encodeURIComponent(packageName)}/purchases/products/${encodeURIComponent(productId)}` +
+      `/tokens/${encodeURIComponent(purchaseToken)}`;
+
+    const response = await client.request<ProductPurchase>({ url });
+    const purchase = response.data;
+
+    if (purchase.purchaseState !== 0) {
+      return { ok: false, reason: 'Purchase is not completed' };
+    }
+
+    return { ok: true, orderId: purchase.orderId };
+  } catch (error) {
+    console.error('[billing] Play verification failed:', error);
+    return { ok: false, reason: 'Could not verify purchase' };
+  }
+};

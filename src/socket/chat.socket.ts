@@ -7,7 +7,8 @@ import {
   MESSAGE_TYPES,
   MessageType,
 } from '../models/Message';
-import { isMatched, getMatchedUserIds } from '../models/Like';
+import { getMatchedUserIds } from '../models/Like';
+import { canViewConversation, getChatAccess, CHAT_ACCESS_ERRORS } from '../services/access.service';
 import { User } from '../models/User';
 import {
   SocketSendMessageData,
@@ -93,7 +94,7 @@ export const initializeSocketIO = (io: Server) => {
 
         // Gate the room itself, not just sends: room members receive typing
         // and read-receipt events for the conversation.
-        if (!(await isMatched(userId, recipientId))) {
+        if (!(await canViewConversation(userId, recipientId))) {
           socket.emit('error', { message: 'You can only chat with your matches' });
           return;
         }
@@ -152,9 +153,14 @@ export const initializeSocketIO = (io: Server) => {
           return;
         }
 
-        // Replaces the old "recipient exists" check: a match implies both users exist.
-        if (!(await isMatched(userId, recipientId))) {
-          socket.emit('error', { message: 'You can only chat with your matches' });
+        // A match implies both users exist; blocks and unpaid chats are refused too.
+        const access = await getChatAccess(userId, recipientId);
+        if (access !== 'ok') {
+          socket.emit('error', {
+            message: CHAT_ACCESS_ERRORS[access],
+            code: access.toUpperCase(),
+            clientId: data?.clientId,
+          });
           return;
         }
 
@@ -171,6 +177,7 @@ export const initializeSocketIO = (io: Server) => {
         const newMessageEvent: SocketNewMessageEvent = {
           conversationId,
           message: message.toJSON() as any,
+          clientId: typeof data?.clientId === 'string' ? data.clientId.slice(0, 64) : undefined,
         };
 
         // Emit to conversation room

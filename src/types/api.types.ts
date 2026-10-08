@@ -179,6 +179,8 @@ export interface GetConversationsResponse {
 export interface SendMessageRequest {
   content: string;
   messageType?: 'text' | 'image' | 'video' | 'audio';
+  // Optional id chosen by the app, echoed back on new_message and error.
+  clientId?: string;
 }
 
 export interface UnreadCountResponse {
@@ -190,6 +192,8 @@ export interface SocketSendMessageData {
   recipientId: string;
   content: string;
   messageType?: 'text' | 'image' | 'video' | 'audio';
+  // Optional id chosen by the app, echoed back on new_message and error.
+  clientId?: string;
 }
 
 export interface SocketTypingData {
@@ -204,6 +208,7 @@ export interface SocketMarkReadData {
 export interface SocketNewMessageEvent {
   conversationId: string;
   message: import('./user.types').Message;
+  clientId?: string;
 }
 
 export interface SocketUserTypingEvent {

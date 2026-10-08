@@ -1,11 +1,18 @@
 import { Response } from 'express';
 import { validationResult } from 'express-validator';
-import { Types } from 'mongoose';
+import { Types, PipelineStage } from 'mongoose';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { User } from '../models/User';
 import { Profile } from '../models/Profile';
 import { Photo } from '../models/Photo';
 import { Like, getMatchedUserIds } from '../models/Like';
+import { Pass } from '../models/Pass';
+import { ProfileView } from '../models/ProfileView';
+import { getBlockedUserIds, isBlockedEitherWay } from '../models/Block';
+import { getConversationId } from '../models/Message';
+import { toCard } from '../services/card.service';
+import { hasActiveInsights } from '../services/wallet.service';
+import { unlockedConversationIds, isChatUnlocked } from '../services/access.service';
 import { uploadImage, uploadMultipleImages } from '../services/cloudinary.service';
 import { calculateDistance } from '../utils/helpers';
 import { notifyNewMatch } from '../services/push.service';
@@ -197,7 +204,9 @@ export const getProfile = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    const user = await User.findById(req.user!.id).select('fullName dateOfBirth gender email phone');
+    const user = await User.findById(req.user!.id).select(
+      'fullName dateOfBirth gender email phone'
+    );
 
     const photos = await Photo.find({ userId: req.user!.id }).sort({ order: 1 });
 
@@ -428,21 +437,70 @@ export const deletePhoto = async (req: AuthRequest, res: Response): Promise<void
 export const getUserProfile = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { userId } = req.params;
+    const viewerId = req.user!.id;
 
-    const user = await User.findById(userId).select('fullName dateOfBirth gender lastActive');
+    if (!Types.ObjectId.isValid(userId)) {
+      res.status(400).json({ error: 'Invalid user id' });
+      return;
+    }
+
+    // A blocked person simply does not exist from either side.
+    if (userId !== viewerId && (await isBlockedEitherWay(viewerId, userId))) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+
+    const user = await User.findOne({ _id: userId, isActive: true }).select(
+      'fullName dateOfBirth gender lastActive'
+    );
 
     if (!user) {
       res.status(404).json({ error: 'User not found' });
       return;
     }
 
-    const profile = await Profile.findOne({ userId });
-    const photos = await Photo.find({ userId }).sort({ order: 1 });
+    const [profile, photos, liked, likedMe, viewerProfile] = await Promise.all([
+      Profile.findOne({ userId }),
+      Photo.find({ userId }).sort({ order: 1 }),
+      Like.exists({ userId: viewerId, targetUserId: userId }),
+      Like.exists({ userId, targetUserId: viewerId }),
+      Profile.findOne({ userId: viewerId }).select('latitude longitude'),
+    ]);
+
+    const isMutual = !!liked && !!likedMe;
+
+    if (userId !== viewerId) {
+      ProfileView.updateOne(
+        { viewerId, viewedId: userId },
+        { $set: { lastViewedAt: new Date() } },
+        { upsert: true }
+      ).catch((error) => console.error('Record profile view error:', error));
+    }
+
+    // Distance from the viewer, when both have a location.
+    const plainProfile = profile ? (profile.toObject() as Record<string, any>) : null;
+    if (
+      plainProfile?.latitude &&
+      plainProfile?.longitude &&
+      viewerProfile?.latitude &&
+      viewerProfile?.longitude
+    ) {
+      const km = calculateDistance(
+        viewerProfile.latitude,
+        viewerProfile.longitude,
+        plainProfile.latitude,
+        plainProfile.longitude
+      );
+      plainProfile.distance = km < 10 ? Math.round(km * 10) / 10 : Math.round(km);
+    }
 
     res.json({
-      user,
-      profile,
-      photos,
+      ...toCard({ user, profile: plainProfile, photos }),
+      relationship: {
+        liked: !!liked,
+        isMutual,
+        chatUnlocked: isMutual && (await isChatUnlocked(viewerId, userId)),
+      },
     });
   } catch (error) {
     console.error('Get user profile error:', error);
@@ -468,7 +526,7 @@ export const likeUser = async (req: AuthRequest, res: Response): Promise<void> =
 
     const targetUser = await User.findOne({ _id: targetUserId, isActive: true });
 
-    if (!targetUser) {
+    if (!targetUser || (await isBlockedEitherWay(userId, targetUserId))) {
       res.status(404).json({ error: 'Target user not found' });
       return;
     }
@@ -568,15 +626,26 @@ export const getReceivedLikes = async (req: AuthRequest, res: Response): Promise
     const { limit = 100 } = req.query;
     const safeLimit = Math.max(1, Math.min(Number(limit), 200));
 
-    const likes = await Like.find({ targetUserId: userId })
-      .sort({ createdAt: -1 })
-      .limit(safeLimit)
-      .lean();
+    // People already liked back are matches and live in Messages instead.
+    const [me, blockedIds, liked] = await Promise.all([
+      User.findById(userId).select('insightsUntil').lean(),
+      getBlockedUserIds(userId),
+      Like.find({ userId }).select('targetUserId').lean(),
+    ]);
 
-    if (!likes || likes.length === 0) {
-      res.json({ likes: [] });
+    const hidden = [...blockedIds, ...liked.map((like) => like.targetUserId.toString())].map(
+      (id) => new Types.ObjectId(id)
+    );
+    const filter = { targetUserId: new Types.ObjectId(userId), userId: { $nin: hidden } };
+    const count = await Like.countDocuments(filter);
+
+    // Without insights the app only learns how many, never who.
+    if (!hasActiveInsights(me?.insightsUntil)) {
+      res.json({ locked: true, count, likes: [] });
       return;
     }
+
+    const likes = await Like.find(filter).sort({ createdAt: -1 }).limit(safeLimit).lean();
 
     const likesWithUsers = await Promise.all(
       likes.map(async (like) => {
@@ -584,22 +653,16 @@ export const getReceivedLikes = async (req: AuthRequest, res: Response): Promise
           User.findOne({ _id: like.userId, isActive: true }).select(
             'fullName dateOfBirth gender lastActive'
           ),
-          Profile.findOne({ userId: like.userId }).select('bio segment'),
+          Profile.findOne({ userId: like.userId }).select('bio segment showAge showDistance'),
           Photo.find({ userId: like.userId }).sort({ order: 1 }),
         ]);
 
-        return {
-          like,
-          user: likerUser,
-          profile: likerProfile,
-          photos: likerPhotos,
-        };
+        const card = toCard({ user: likerUser, profile: likerProfile, photos: likerPhotos });
+        return card ? { ...card, likedAt: like.createdAt } : null;
       })
     );
 
-    const validLikes = likesWithUsers.filter((item) => item.user !== null);
-
-    res.json({ likes: validLikes });
+    res.json({ locked: false, count, likes: likesWithUsers.filter(Boolean) });
   } catch (error) {
     console.error('Get received likes error:', error);
     res.status(500).json({ error: 'Failed to get received likes' });
@@ -610,7 +673,12 @@ export const getReceivedLikes = async (req: AuthRequest, res: Response): Promise
 export const getMatches = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
-    const matchedUserIds = await getMatchedUserIds(userId);
+    const [allMatchedIds, blockedIds] = await Promise.all([
+      getMatchedUserIds(userId),
+      getBlockedUserIds(userId),
+    ]);
+    const blocked = new Set(blockedIds);
+    const matchedUserIds = allMatchedIds.filter((id) => !blocked.has(id));
 
     if (matchedUserIds.length === 0) {
       res.json({ matches: [] });
@@ -622,7 +690,9 @@ export const getMatches = async (req: AuthRequest, res: Response): Promise<void>
       User.find({ _id: { $in: matchedUserIds }, isActive: true }).select(
         'fullName dateOfBirth gender lastActive'
       ),
-      Profile.find({ userId: { $in: matchedUserIds } }).select('userId bio segment'),
+      Profile.find({ userId: { $in: matchedUserIds } }).select(
+        'userId bio segment showAge showDistance'
+      ),
       Photo.find({ userId: { $in: matchedUserIds } }).sort({ order: 1 }),
     ]);
 
@@ -642,13 +712,20 @@ export const getMatches = async (req: AuthRequest, res: Response): Promise<void>
       }
     });
 
+    const unlocked = await unlockedConversationIds(
+      matchedUserIds.map((id) => getConversationId(userId, id))
+    );
+
     const matches = users.map((user) => {
       const key = (user._id as Types.ObjectId).toString();
 
       return {
-        user,
-        profile: profileByUserId.get(key) || null,
-        photos: photosByUserId.get(key) || [],
+        ...toCard({
+          user,
+          profile: profileByUserId.get(key) || null,
+          photos: photosByUserId.get(key) || [],
+        }),
+        chatUnlocked: unlocked.has(getConversationId(userId, key)),
       };
     });
 
@@ -659,7 +736,11 @@ export const getMatches = async (req: AuthRequest, res: Response): Promise<void>
   }
 };
 
-// Get nearby users for discovery/feed
+// Get nearby users for discovery/feed.
+//
+// Shows people in the same segment who are visible, active, inside the
+// viewer's distance and age filters, and not already liked, passed, matched or
+// blocked in either direction.
 export const getNearbyUsers = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const errors = validationResult(req);
@@ -668,20 +749,17 @@ export const getNearbyUsers = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    const { limit = 10, latitude, longitude } = req.query;
+    const { limit = 20, latitude, longitude } = req.query;
     const userId = req.user!.id;
     const safeLimit = Math.max(1, Math.min(Number(limit), 50));
 
-    // Get current user's profile
     let currentProfile = await Profile.findOne({ userId });
     const currentSegment = currentProfile?.segment || 'relationship';
 
-    // Auto-update user location if coordinates are provided (with throttling)
+    // Auto-update the viewer's location when coordinates are sent (throttled).
     if (latitude && longitude) {
       const lat = parseFloat(latitude as string);
       const lng = parseFloat(longitude as string);
-
-      // Check if we should update location (throttle to reduce DB writes)
       let shouldUpdateLocation = true;
 
       if (
@@ -698,151 +776,186 @@ export const getNearbyUsers = async (req: AuthRequest, res: Response): Promise<v
         const timeSinceLastUpdate =
           Date.now() - new Date(currentProfile.locationUpdatedAt).getTime();
 
-        // Only update if moved > 500m OR last update was > 5 minutes ago
         shouldUpdateLocation =
           distanceMoved > LOCATION_UPDATE_DISTANCE_THRESHOLD ||
           timeSinceLastUpdate > LOCATION_UPDATE_TIME_THRESHOLD;
       }
 
       if (shouldUpdateLocation) {
-        const locationUpdate = {
-          latitude: lat,
-          longitude: lng,
-          locationUpdatedAt: new Date(),
-          location: {
-            type: 'Point',
-            coordinates: [lng, lat], // GeoJSON format: [longitude, latitude]
-          },
-        };
-
         currentProfile = await Profile.findOneAndUpdate(
           { userId },
-          { $set: locationUpdate },
+          {
+            $set: {
+              latitude: lat,
+              longitude: lng,
+              locationUpdatedAt: new Date(),
+              location: { type: 'Point', coordinates: [lng, lat] },
+            },
+          },
           { new: true, upsert: true }
         );
       }
     }
 
-    // Add location-based filtering if available
-    const hasLocation =
-      currentProfile?.location?.coordinates ||
-      (currentProfile?.latitude && currentProfile?.longitude);
+    const [liked, passed, blockedIds] = await Promise.all([
+      Like.find({ userId }).select('targetUserId').lean(),
+      Pass.find({ userId }).select('targetUserId').lean(),
+      getBlockedUserIds(userId),
+    ]);
 
-    if (hasLocation && currentProfile) {
-      let userLocation: { type: 'Point'; coordinates: [number, number] } | undefined;
+    const excluded = [
+      userId,
+      ...liked.map((like) => like.targetUserId.toString()),
+      ...passed.map((pass) => pass.targetUserId.toString()),
+      ...blockedIds,
+    ].map((id) => new Types.ObjectId(id));
 
-      // Use GeoJSON location if available, otherwise convert lat/lng
-      if (currentProfile.location?.coordinates) {
-        userLocation = {
-          type: 'Point',
-          coordinates: [
-            currentProfile.location.coordinates[0],
-            currentProfile.location.coordinates[1],
-          ],
-        };
-      } else if (currentProfile.latitude && currentProfile.longitude) {
-        userLocation = {
-          type: 'Point',
-          coordinates: [currentProfile.longitude, currentProfile.latitude],
-        };
-      }
-
-      if (!userLocation) {
-        res.json({ users: [] });
-        return;
-      }
-
-      // Default radius is 35km - show closest users first
-      const maxDistance = 35000; // 35km in meters
-
-      // Use aggregation to get profiles sorted by distance
-      const nearbyProfiles = await Profile.aggregate([
-        {
-          $geoNear: {
-            near: userLocation,
-            distanceField: 'distance',
-            maxDistance: maxDistance,
-            spherical: true,
-            query: {
-              userId: { $ne: new Types.ObjectId(userId) },
-              segment: currentSegment,
-              isVisible: true,
-            },
-          },
-        },
-        {
-          $sort: { distance: 1 }, // Sort by distance ascending (closest first)
-        },
-        {
-          $limit: safeLimit,
-        },
-      ]);
-
-      if (!nearbyProfiles || nearbyProfiles.length === 0) {
-        res.json({ users: [] });
-        return;
-      }
-
-      // Get user details and photos for each nearby profile
-      const usersWithProfiles = await Promise.all(
-        nearbyProfiles.map(async (profile) => {
-          const user = await User.findById(profile.userId).select(
-            'fullName dateOfBirth gender lastActive'
-          );
-          const photos = await Photo.find({ userId: profile.userId }).sort({ order: 1 });
-          return {
-            user,
-            profile: {
-              ...profile,
-              distance: Math.round(profile.distance / 1000), // Convert to km
-            },
-            photos,
-          };
-        })
-      );
-
-      // Filter out any null users (in case user was deleted but profile remains)
-      const validUsers = usersWithProfiles.filter((item) => item.user !== null);
-
-      res.json({ users: validUsers });
-      return;
-    }
-
-    // Fallback for users without location - return users in the same segment.
-    const segmentProfiles = await Profile.find({
-      userId: { $ne: new Types.ObjectId(userId) },
+    const profileFilter = {
+      userId: { $nin: excluded },
       segment: currentSegment,
       isVisible: true,
-    })
-      .limit(safeLimit)
+    };
+
+    // Age range as a date-of-birth window.
+    const ageMin = currentProfile?.ageMin ?? 18;
+    const ageMax = currentProfile?.ageMax ?? 99;
+    const now = new Date();
+    const youngestDob = new Date(now.getFullYear() - ageMin, now.getMonth(), now.getDate());
+    const oldestDob = new Date(now.getFullYear() - ageMax - 1, now.getMonth(), now.getDate() + 1);
+
+    const coordinates = currentProfile?.location?.coordinates?.length
+      ? [currentProfile.location.coordinates[0], currentProfile.location.coordinates[1]]
+      : currentProfile?.latitude && currentProfile?.longitude
+        ? [currentProfile.longitude, currentProfile.latitude]
+        : null;
+
+    const firstStage: PipelineStage = coordinates
+      ? {
+          $geoNear: {
+            near: { type: 'Point', coordinates } as any,
+            distanceField: 'distance',
+            maxDistance: (currentProfile?.maxDistanceKm ?? 35) * 1000,
+            spherical: true,
+            query: profileFilter,
+          },
+        }
+      : { $match: profileFilter };
+
+    const rows = await Profile.aggregate([
+      firstStage,
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'userId',
+          foreignField: '_id',
+          as: 'user',
+          pipeline: [
+            {
+              $match: {
+                isActive: true,
+                $or: [
+                  { dateOfBirth: { $gte: oldestDob, $lte: youngestDob } },
+                  { dateOfBirth: { $exists: false } },
+                ],
+              },
+            },
+            { $project: { fullName: 1, dateOfBirth: 1, gender: 1, lastActive: 1 } },
+          ],
+        },
+      },
+      { $unwind: '$user' },
+      { $limit: safeLimit },
+    ]);
+
+    const photos = await Photo.find({ userId: { $in: rows.map((row) => row.userId) } })
+      .sort({ order: 1 })
       .lean();
 
-    if (!segmentProfiles || segmentProfiles.length === 0) {
-      res.json({ users: [] });
-      return;
-    }
-
-    // Get user details and photos for each matched segment profile.
-    const usersWithProfiles = await Promise.all(
-      segmentProfiles.map(async (profile) => {
-        const user = await User.findOne({ _id: profile.userId, isActive: true }).select(
-          'fullName dateOfBirth gender lastActive'
-        );
-        const photos = await Photo.find({ userId: profile.userId }).sort({ order: 1 });
-
-        return {
+    const users = rows
+      .map((row) => {
+        const { user, ...profile } = row;
+        if (typeof profile.distance === 'number') {
+          // One decimal under 10 km so "0.4 km" and "< 1 km away" stay possible.
+          const km = profile.distance / 1000;
+          profile.distance = km < 10 ? Math.round(km * 10) / 10 : Math.round(km);
+        }
+        return toCard({
           user,
           profile,
-          photos,
-        };
+          photos: photos.filter((photo) => photo.userId.toString() === row.userId.toString()),
+        });
       })
-    );
+      .filter(Boolean);
 
-    const validUsers = usersWithProfiles.filter((item) => item.user !== null);
-
-    res.json({ users: validUsers });
+    res.json({ users });
   } catch (error) {
     console.error('Get nearby users error:', error);
     res.status(500).json({ error: 'Failed to get nearby users' });
+  }
+};
+
+// POST /api/profiles/passes/:targetUserId
+export const passUser = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.id;
+    const { targetUserId } = req.params;
+
+    if (!Types.ObjectId.isValid(targetUserId) || targetUserId === userId) {
+      res.status(400).json({ error: 'Invalid target user ID' });
+      return;
+    }
+
+    await Pass.updateOne(
+      { userId, targetUserId },
+      { $setOnInsert: { userId, targetUserId } },
+      { upsert: true }
+    );
+
+    res.status(201).json({ passed: true, targetUserId });
+  } catch (error) {
+    console.error('Pass user error:', error);
+    res.status(500).json({ error: 'Failed to pass user' });
+  }
+};
+
+// GET /api/profiles/views. Who viewed me; full list needs active insights.
+export const getProfileViews = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.id;
+    const [me, blockedIds] = await Promise.all([
+      User.findById(userId).select('insightsUntil').lean(),
+      getBlockedUserIds(userId),
+    ]);
+
+    const filter = {
+      viewedId: userId,
+      viewerId: { $nin: blockedIds.map((id) => new Types.ObjectId(id)) },
+    };
+    const count = await ProfileView.countDocuments(filter);
+
+    if (!hasActiveInsights(me?.insightsUntil)) {
+      res.json({ locked: true, count, views: [] });
+      return;
+    }
+
+    const views = await ProfileView.find(filter).sort({ lastViewedAt: -1 }).limit(100).lean();
+    const cards = await Promise.all(
+      views.map(async (view) => {
+        const [user, profile, photos] = await Promise.all([
+          User.findOne({ _id: view.viewerId, isActive: true }).select(
+            'fullName dateOfBirth gender lastActive'
+          ),
+          Profile.findOne({ userId: view.viewerId }).select('bio segment showAge showDistance'),
+          Photo.find({ userId: view.viewerId }).sort({ order: 1 }),
+        ]);
+        const card = toCard({ user, profile, photos });
+        return card ? { ...card, viewedAt: view.lastViewedAt } : null;
+      })
+    );
+
+    res.json({ locked: false, count, views: cards.filter(Boolean) });
+  } catch (error) {
+    console.error('Get profile views error:', error);
+    res.status(500).json({ error: 'Failed to get profile views' });
   }
 };

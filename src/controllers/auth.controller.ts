@@ -12,6 +12,12 @@ import { AuthRequest } from '../middleware/auth.middleware';
 import { User, IUser } from '../models/User';
 import { Profile } from '../models/Profile';
 import { RefreshToken } from '../models/RefreshToken';
+import { Photo } from '../models/Photo';
+import { PushToken } from '../models/PushToken';
+import { CoinTransaction } from '../models/CoinTransaction';
+import { DatePost } from '../models/DatePost';
+import { deleteImage } from '../services/cloudinary.service';
+import { SIGNUP_BONUS_COINS, SIGNUP_BONUS_REF } from '../config/coins';
 import {
   RequestOTPRequest,
   RequestOTPResponse,
@@ -56,9 +62,22 @@ export const requestOTP = async (req: Request, res: Response): Promise<void> => 
         phone,
         otpCode: otp,
         otpExpiry,
+        coins: SIGNUP_BONUS_COINS,
       });
 
       await Profile.create({ userId: user._id });
+
+      if (SIGNUP_BONUS_COINS > 0) {
+        await CoinTransaction.create({
+          userId: user._id,
+          amount: SIGNUP_BONUS_COINS,
+          balanceAfter: SIGNUP_BONUS_COINS,
+          reason: 'bonus',
+          refId: SIGNUP_BONUS_REF,
+          // The app shows a welcome sheet for it once the user reaches the main screen.
+          announced: false,
+        });
+      }
     }
 
     if (email) {
@@ -103,7 +122,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     });
 
     if (!user) {
-      res.status(404).json({ error: 'This user doesn\'t exist' });
+      res.status(404).json({ error: "This user doesn't exist" });
       return;
     }
 
@@ -249,8 +268,10 @@ export const verifyOTP = async (req: Request, res: Response): Promise<void> => {
       !user.fullName || !user.dateOfBirth || !user.gender || !profile?.segment;
     const needsEmail = !user.email;
     const needsPhone = !user.phone;
+    // Lets the apps resume onboarding at the photo step.
+    const photoCount = await Photo.countDocuments({ userId: user._id });
 
-    const response: LoginResponse = {
+    const response: LoginResponse & { photoCount: number } = {
       ...tokens,
       user: {
         ...user.toObject(),
@@ -260,6 +281,7 @@ export const verifyOTP = async (req: Request, res: Response): Promise<void> => {
       needsProfileCompletion,
       needsEmail,
       needsPhone,
+      photoCount,
     };
 
     res.json(response);
@@ -353,5 +375,49 @@ export const refreshToken = async (req: Request, res: Response): Promise<void> =
   } catch (error) {
     console.error('Token refresh error:', error);
     res.status(500).json({ error: 'Token refresh failed' });
+  }
+};
+
+/**
+ * DELETE /api/auth/account
+ *
+ * Deactivates the account and frees the email and phone so they can sign up
+ * again. Photos are removed from Cloudinary; messages stay so the other side's
+ * history does not silently change, but the profile disappears everywhere.
+ */
+export const deleteAccount = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.id;
+    const photos = await Photo.find({ userId }).select('publicId').lean();
+
+    await Promise.all(
+      photos
+        .filter((photo) => photo.publicId)
+        .map((photo) =>
+          deleteImage(photo.publicId!).catch((error) =>
+            console.error('Delete account photo error:', error)
+          )
+        )
+    );
+
+    await Promise.all([
+      Photo.deleteMany({ userId }),
+      RefreshToken.deleteMany({ userId }),
+      PushToken.deleteMany({ userId }),
+      DatePost.updateMany({ userId, status: 'active' }, { status: 'cancelled' }),
+      Profile.updateOne({ userId }, { isVisible: false }),
+      User.updateOne(
+        { _id: userId },
+        {
+          $set: { isActive: false, deletedAt: new Date(), fullName: 'Deleted user' },
+          $unset: { email: '', phone: '', otpCode: '', otpExpiry: '' },
+        }
+      ),
+    ]);
+
+    res.json({ deleted: true });
+  } catch (error) {
+    console.error('Delete account error:', error);
+    res.status(500).json({ error: 'Failed to delete account' });
   }
 };

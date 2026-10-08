@@ -1,13 +1,21 @@
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { PushToken, isExpoPushToken } from '../models/PushToken';
+import { PushToken, PushProvider, isExpoPushToken, isFcmToken } from '../models/PushToken';
+
+// Expo tokens are recognisable by shape; anything else must say it is FCM.
+const resolveProvider = (token: unknown, provider: unknown): PushProvider | null => {
+  if (isExpoPushToken(token)) return 'expo';
+  if (provider === 'fcm' && isFcmToken(token)) return 'fcm';
+  return null;
+};
 
 export const registerPushToken = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { token, platform } = req.body;
+    const { token, platform, provider } = req.body;
     const userId = req.user!.id;
+    const resolvedProvider = resolveProvider(token, provider);
 
-    if (!isExpoPushToken(token)) {
+    if (!resolvedProvider) {
       res.status(400).json({ error: 'Invalid push token' });
       return;
     }
@@ -17,7 +25,12 @@ export const registerPushToken = async (req: AuthRequest, res: Response): Promis
     // both subscriptions alive.
     await PushToken.findOneAndUpdate(
       { token },
-      { token, userId, platform: platform === 'ios' || platform === 'android' ? platform : undefined },
+      {
+        token,
+        userId,
+        provider: resolvedProvider,
+        platform: platform === 'ios' || platform === 'android' ? platform : undefined,
+      },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
@@ -33,7 +46,7 @@ export const deletePushToken = async (req: AuthRequest, res: Response): Promise<
     const { token } = req.body;
     const userId = req.user!.id;
 
-    if (!isExpoPushToken(token)) {
+    if (typeof token !== 'string' || !token) {
       res.status(400).json({ error: 'Invalid push token' });
       return;
     }

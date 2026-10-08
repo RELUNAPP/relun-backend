@@ -8,6 +8,7 @@ import {
   logout,
   getCurrentUser,
   refreshToken,
+  deleteAccount,
 } from '../controllers/auth.controller';
 
 const router = Router();
@@ -44,5 +45,7 @@ router.get('/me', authenticate, getCurrentUser);
 
 // Refresh token
 router.post('/refresh', refreshToken);
+
+router.delete('/account', authenticate, deleteAccount);
 
 export default router;

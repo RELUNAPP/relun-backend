@@ -30,6 +30,10 @@ export interface IProfile extends Document {
   isVisible: boolean;
   showAge: boolean;
   showDistance: boolean;
+  notificationsEnabled: boolean;
+  maxDistanceKm: number;
+  ageMin: number;
+  ageMax: number;
   isComplete: boolean;
   completenessScore: number;
 }
@@ -92,6 +96,11 @@ const profileSchema = new Schema<IProfile>(
     isVisible: { type: Boolean, default: true },
     showAge: { type: Boolean, default: true },
     showDistance: { type: Boolean, default: true },
+    notificationsEnabled: { type: Boolean, default: true },
+    // Discovery filters, set from the Filters sheet.
+    maxDistanceKm: { type: Number, default: 35, min: 1, max: 100 },
+    ageMin: { type: Number, default: 18, min: 18, max: 99 },
+    ageMax: { type: Number, default: 99, min: 18, max: 99 },
     isComplete: { type: Boolean, default: false },
     completenessScore: { type: Number, default: 0 },
   },

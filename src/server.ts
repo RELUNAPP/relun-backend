@@ -17,6 +17,10 @@ import authRoutes from './routes/auth.routes';
 import profileRoutes from './routes/profile.routes';
 import chatRoutes from './routes/chat.routes';
 import notificationRoutes from './routes/notification.routes';
+import coinsRoutes from './routes/coins.routes';
+import datesRoutes from './routes/dates.routes';
+import safetyRoutes from './routes/safety.routes';
+import settingsRoutes from './routes/settings.routes';
 
 // Import socket handler
 import { initializeSocketIO } from './socket/chat.socket';
@@ -41,7 +45,14 @@ app.use(
     credentials: true,
   })
 );
-app.use(express.json());
+app.use(
+  express.json({
+    // Paystack webhooks are signed over the exact bytes received.
+    verify: (req, _res, buf) => {
+      (req as Request & { rawBody?: Buffer }).rawBody = buf;
+    },
+  })
+);
 app.use(express.urlencoded({ extended: true }));
 
 // Request logging middleware
@@ -64,6 +75,10 @@ app.use('/api/auth', authRoutes);
 app.use('/api/profiles', profileRoutes);
 app.use('/api/chat', chatRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/coins', coinsRoutes);
+app.use('/api/dates', datesRoutes);
+app.use('/api/safety', safetyRoutes);
+app.use('/api/settings', settingsRoutes);
 
 // 404 handler
 app.use((_req: Request, res: Response) => {

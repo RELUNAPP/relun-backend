@@ -16,6 +16,8 @@ import {
   getLikeStatus,
   getReceivedLikes,
   getMatches,
+  passUser,
+  getProfileViews,
 } from '../controllers/profile.controller';
 
 const router = Router();
@@ -91,6 +93,17 @@ router.get(
 );
 
 router.get('/likes/received', authenticate, getReceivedLikes);
+
+// Not interested, so Discover stops showing them.
+router.post(
+  '/passes/:targetUserId',
+  authenticate,
+  [param('targetUserId').isMongoId().withMessage('Invalid target user ID')],
+  passUser
+);
+
+// Who viewed my profile (gated on insights).
+router.get('/views', authenticate, getProfileViews);
 
 // Mutual matches. Must stay above '/:userId' or that route swallows it.
 router.get('/matches', authenticate, getMatches);

@@ -12,6 +12,9 @@ export interface IUser extends Document {
   lastActive?: Date;
   otpCode?: string;
   otpExpiry?: Date;
+  coins: number;
+  insightsUntil?: Date;
+  deletedAt?: Date;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -29,6 +32,12 @@ const userSchema = new Schema<IUser>(
     lastActive: { type: Date },
     otpCode: { type: String },
     otpExpiry: { type: Date },
+    // Coin balance. Only ever changed through services/wallet.service so every
+    // change has a matching CoinTransaction row.
+    coins: { type: Number, default: 0, min: 0 },
+    // Who-liked-you / profile-views access is paid for in 30-day blocks.
+    insightsUntil: { type: Date },
+    deletedAt: { type: Date },
   },
   { timestamps: true }
 );
